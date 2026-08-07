@@ -179,35 +179,6 @@ class TrackingCost(ABC):
         pass
 
 
-class BilevelCost(TrackingCost):
-    """
-    An intermediate base class that provides functionality common to bilevel
-    optimization costs.
-    """
-    def __init__(self):
-        super().__init__()
-
-    def apply_offsets(self, offsets: np.ndarray) -> None:
-        """
-        Apply XYZ placement offsets to each task's cached station. Each offset is an
-        translation, expressed in the task's base frame, applied to the baseline
-        station.
-
-        Parameters
-        ----------
-        offsets: np.ndarray, shape (3 * len(offset_groups),)
-            XYZ offset variables, one Vec3 per offset group.
-        """
-        for i, g in enumerate(self.offset_group_indexes):
-            if g is None:
-                continue
-            o = np.asarray(offsets[3*g : 3*g+3], dtype=float)
-            s = self.base_stations[i] + o
-            self.stations.updElt(i).set(0, float(s[0]))
-            self.stations.updElt(i).set(1, float(s[1]))
-            self.stations.updElt(i).set(2, float(s[2]))
-
-
 class FrameTrackingCost(FrameTasks, TrackingCost):
     """
     A tracking cost that computes the aggregate error between model frames' positions
@@ -323,6 +294,15 @@ class MarkerTrackingCost(MarkerTasks, TrackingCost):
         return [np.expand_dims(vec.to_numpy()[self.mc.q_indexes], axis=0)]
 
 
+class BilevelCost(TrackingCost):
+    """
+    An intermediate base class that provides functionality common to bilevel
+    optimization costs.
+    """
+    def __init__(self):
+        super().__init__()
+
+
 class MarkerBilevelCost(MarkerTasks, BilevelCost):
     """
     A tracking cost that computes the aggregate error between model markers' scaled
@@ -349,6 +329,35 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
         self.initialize_tasks()
         self.body_scale_groups = body_scale_groups
         self.offset_groups = offset_groups
+        self.mobod_to_scale_group: dict[int, int] = {
+            int(k): g for g, group in enumerate(self.body_scale_groups)
+            for k in group.mobod_indexes}
+
+    def apply_scales(self, body_scales: np.ndarray) -> None:
+        for itask in range(self.num_tasks):
+            s = self.base_stations[itask].copy()
+            mobod_index = int(self.mobod_indexes.getElt(itask))
+            if mobod_index in self.mobod_to_scale_group:
+                g = self.mobod_to_scale_group[mobod_index]
+                bs = np.asarray(body_scales[3*g : 3*g+3], dtype=float)
+                s *= bs
+            self.stations.updElt(itask).set(0, float(s[0]))
+            self.stations.updElt(itask).set(1, float(s[1]))
+            self.stations.updElt(itask).set(2, float(s[2]))
+
+    def apply_offsets(self, offsets: np.ndarray) -> None:
+        for i, g in enumerate(self.offset_group_indexes):
+            if g is None:
+                continue
+            o = np.asarray(offsets[3*g : 3*g+3], dtype=float)
+            s = self.stations.getElt(i).to_numpy() + o
+            self.stations.updElt(i).set(0, float(s[0]))
+            self.stations.updElt(i).set(1, float(s[1]))
+            self.stations.updElt(i).set(2, float(s[2]))
+
+    def apply_state(self, body_scales: np.ndarray, offsets: np.ndarray) -> None:
+        self.apply_scales(body_scales)
+        self.apply_offsets(offsets)
 
     def calc_error(self, state, **kwargs) -> float:
         error = 0.0
@@ -367,14 +376,20 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
             return [Jq, Js, Jo]
 
         # Calculate the per-marker error gradient in Ground. This is a force-like term
-        # will be multiplied with (the transpose of) each position Jacobian below.
+        # will be multiplied with (the transpose of) each position Jacobian below. Also,
+        # precompute the sensitivity of each marker's ground position to a shift from
+        # an offset variable.
         dp_GS = osim.VectorVec3(self.num_tasks, osim.Vec3(0))
+        doffset = np.zeros((self.num_tasks, 3))
         for i, (frame, position, weight) in enumerate(
                 zip(self.base_frames, self.positions, self.weights)):
             p_GS = frame.findStationLocationInGround(state, self.stations.getElt(i))
             dp_GS.set(i, osim.Vec3(2.0 * weight * (p_GS[0] - position[0]),
                                    2.0 * weight * (p_GS[1] - position[1]),
                                    2.0 * weight * (p_GS[2] - position[2])))
+            rotation = frame.getRotationInGround(state)
+            R_GB = np.array([[rotation.get(r, c) for c in range(3)] for r in range(3)])
+            doffset[i] = dp_GS.get(i).to_numpy() @ R_GB
 
         # Calculate the Jacobian of the position error with respect to the coordinates.
         vec = osim.Vector(state.getNQ(), 0.0)
@@ -399,16 +414,18 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
         Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB,
                                                             self.body_scale_groups)
 
-        # Calculate the position-error Jacobian with respect to the marker offsets. The
-        # offset shifts the station in the base frame, so its effect on the ground
-        # position is `R_GB`, the base frame's rotation in Ground. Hence the offset
-        # gradient column is `dp_GS_i @ R_GB` accumulated per offset group.
-        for i, g in enumerate(self.offset_group_indexes):
-            if g is None:
+        # Assemble the marker offset Jacobian based on the offset sensitivities. Also,
+        # include the contributions from the marker offsets to the Jacobian with respect
+        # to body scales.
+        for i in range(self.num_tasks):
+            g_off = self.offset_group_indexes[i]
+            g_scale = self.mobod_to_scale_group.get(int(self.mobod_indexes.getElt(i)))
+            if g_off is None and g_scale is None:
                 continue
-            rotation = self.base_frames[i].getRotationInGround(state)
-            R_GB = np.array([[rotation.get(i, j) for j in range(3)] for i in range(3)])
-            Jo[0, 3*g:3*g+3] += dp_GS.get(i).to_numpy() @ R_GB
+            if g_off is not None:
+                Jo[0, 3*g_off:3*g_off+3] += doffset[i]
+            if g_scale is not None:
+                Js[0, 3*g_scale:3*g_scale+3] += self.base_stations[i] * doffset[i]
 
         return [Jq, Js, Jo]
 
@@ -439,6 +456,35 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
         self.initialize_tasks()
         self.body_scale_groups = body_scale_groups
         self.offset_groups = offset_groups
+        self.mobod_to_scale_group: dict[int, int] = {
+            int(k): g for g, group in enumerate(self.body_scale_groups)
+            for k in group.mobod_indexes}
+
+    def apply_scales(self, body_scales: np.ndarray) -> None:
+        for itask in range(self.num_tasks):
+            s = self.base_stations[itask].copy()
+            mobod_index = int(self.mobod_indexes.getElt(itask))
+            if mobod_index in self.mobod_to_scale_group:
+                g = self.mobod_to_scale_group[mobod_index]
+                bs = np.asarray(body_scales[3*g : 3*g+3], dtype=float)
+                s *= bs
+            self.stations.updElt(itask).set(0, float(s[0]))
+            self.stations.updElt(itask).set(1, float(s[1]))
+            self.stations.updElt(itask).set(2, float(s[2]))
+
+    def apply_offsets(self, offsets: np.ndarray) -> None:
+        for i, g in enumerate(self.offset_group_indexes):
+            if g is None:
+                continue
+            o = np.asarray(offsets[3*g : 3*g+3], dtype=float)
+            s = self.stations.getElt(i).to_numpy() + o
+            self.stations.updElt(i).set(0, float(s[0]))
+            self.stations.updElt(i).set(1, float(s[1]))
+            self.stations.updElt(i).set(2, float(s[2]))
+
+    def apply_state(self, body_scales: np.ndarray, offsets: np.ndarray) -> None:
+        self.apply_scales(body_scales)
+        self.apply_offsets(offsets)
 
     def calc_error(self, state, **kwargs) -> float:
         error = 0.0
@@ -466,8 +512,10 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
         # position and orientation error) for each.
         spatialError = osim.VectorOfSpatialVec(self.num_tasks, osim.SpatialVec(0))
         # Store the position-error gradient along the way. We need it for the body scale
-        # and offset Jacobian calculations.
+        # and offset Jacobian calculations. Also, precompute the sensitivity of each
+        # frame's ground position to a shift from an offset variable.
         dp_GF = osim.VectorVec3(self.num_tasks, osim.Vec3(0))
+        doffset = np.zeros((self.num_tasks, 3))
         for i, (frame, base_frame) in enumerate(zip(self.frames, self.base_frames)):
             wp = self.position_weights[i]
             wo = self.orientation_weights[i]
@@ -492,6 +540,11 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
             # frame Jacobian operator below.
             spatialError.set(i, osim.SpatialVec(dw_GF, dp_GF.get(i)))
 
+            # Precompute the position sensitivity to a base-frame station shift.
+            rotation = base_frame.getRotationInGround(state)
+            R_GB = np.array([[rotation.get(r, c) for c in range(3)] for r in range(3)])
+            doffset[i] = dp_GF.get(i).to_numpy() @ R_GB
+
         # Calculate the frame (position and orientation) error Jacobian.
         vec = osim.Vector(state.getNQ(), 0.0)
         self.mc.model.multiplyByFrameJacobianTranspose(
@@ -511,23 +564,23 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
             cur = dp_GB.get(k).to_numpy() + dp_GF.get(i).to_numpy()
             dp_GB.set(k, osim.Vec3(float(cur[0]), float(cur[1]), float(cur[2])))
 
-        # Calculate the position-error Jacobian with respect to body scales.
+        # Calculate the position-error Jacobian with respect to body scales. This does
+        # not include the contributions from frame offsets, we will include that below.
         Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB,
                                                             self.body_scale_groups)
 
-
-        # Calculate the position-error Jacobian with respect to the frame offsets. The
-        # offset shifts the station in the base frame, so its effect on the ground
-        # position is `R_GB`, the base frame's rotation in Ground. A translation offset
-        # does not affect the orientation error, so only the position gradient
-        # contributes. Hence the offset gradient column is `dp_GF_i @ R_GB` accumulated
-        # per offset group.
-        for i, g in enumerate(self.offset_group_indexes):
-            if g is None:
+        # Assemble the frame offset Jacobian based on the offset sensitivities. Also,
+        # include the contributions from the frame offsets to the Jacobian with respect
+        # to body scales.
+        for i in range(self.num_tasks):
+            g_off = self.offset_group_indexes[i]
+            g_scale = self.mobod_to_scale_group.get(int(self.mobod_indexes.getElt(i)))
+            if g_off is None and g_scale is None:
                 continue
-            rotation = self.base_frames[i].getRotationInGround(state)
-            R_GB = np.array([[rotation.get(i, j) for j in range(3)] for i in range(3)])
-            Jo[0, 3*g:3*g+3] += dp_GF.get(i).to_numpy() @ R_GB
+            if g_off is not None:
+                Jo[0, 3*g_off:3*g_off+3] += doffset[i]
+            if g_scale is not None:
+                Js[0, 3*g_scale:3*g_scale+3] += self.base_stations[i] * doffset[i]
 
         return [Jq, Js, Jo]
 
@@ -768,13 +821,15 @@ class BilevelCostFunction(Function):
         """
         body_scales = np.squeeze(arg[1].full())
         body_scales = np.atleast_1d(body_scales).astype(float)
-        self.mc.set_scaled_mobilizer_frame_positions(self.state, self.body_scale_groups,
+        self.mc.set_scaled_mobilizer_frame_positions(self.state,
+                                                     self.body_scale_groups,
                                                      body_scales)
 
         marker_offsets = np.atleast_1d(np.squeeze(arg[2].full())).astype(float)
+        self.marker_cost.apply_state(body_scales, marker_offsets)
+
         frame_offsets = np.atleast_1d(np.squeeze(arg[3].full())).astype(float)
-        self.marker_cost.apply_offsets(marker_offsets)
-        self.frame_cost.apply_offsets(frame_offsets)
+        self.frame_cost.apply_state(body_scales, frame_offsets)
 
         q = np.zeros(self.state.getNQ())
         q[self.mc.q_indexes] = np.squeeze(arg[0].full())

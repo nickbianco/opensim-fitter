@@ -7,7 +7,9 @@ import opensim as osim
 from osimfit.data_sources import DataSource, MarkerSource
 
 
-# Helper functions.
+###########
+# HELPERS #
+###########
 
 def create_Vec3_table(times, labels):
     """
@@ -67,7 +69,9 @@ class NoSource(DataSource):
     pass
 
 
-# Test provides_positions() and provides_orientations() properties.
+#########################
+# DATA SOURCE INTERFACE #
+#########################
 
 def test_provides_positions_only():
     src = PositionsSource()
@@ -94,15 +98,10 @@ def test_no_source_provided():
 
 
 def test_marker_source_provides_positions_only():
-    # MarkerSource.__init__ only stores the path — does not open the file —
-    # so a nonexistent path is safe for property-level checks.
     src = MarkerSource('nonexistent.trc')
     assert src.provides_positions is True
     assert src.provides_orientations is False
 
-
-# Test that get_positions_tabe() and get_orientations_table() raise exceptions when
-# data unavailable in subclasses
 
 def test_get_positions_raises_with_subclass_name_when_not_provided():
     with pytest.raises(NotImplementedError, match='NoSource'):
@@ -124,7 +123,9 @@ def test_get_positions_raises_on_orientations_only_subclass():
         OrientationsSource().get_positions_table()
 
 
-# Test static helper functions for modifying TimeSeriesTables.
+################
+# MODIFY TABLE #
+################
 
 def test_remove_columns_drops_listed_columns():
     table = create_Vec3_table([0.0, 0.1], ['a', 'b', 'c'])
@@ -156,7 +157,19 @@ def test_assert_position_orientation_consistent_raises_on_label_mismatch():
         DataSource.trim_table_to_range(table, (1.5, 0.5))
 
 
-# Test consistency between position and orientation tables.
+def test_init_raises_for_non_tuple_trim_to_range():
+    with pytest.raises(ValueError, match='tuple'):
+        NoSource(trim_to_range=[0.0, 1.0])
+
+
+def test_init_raises_for_wrong_length_trim_to_range():
+    with pytest.raises(ValueError, match='tuple'):
+        NoSource(trim_to_range=(0.0, 0.5, 1.0))
+
+
+###############
+# CONSISTENCY #
+###############
 
 def test_assert_position_orientation_consistent_happy_path():
     positions = create_Vec3_table([0.0, 0.1], ['a', 'b'])
@@ -188,8 +201,6 @@ def test_assert_position_orientation_consistent_raises_on_time_mismatch():
             positions, orientations)
 
 
-# Test consistency between table time vectors.
-
 def test_assert_tables_share_times_returns_shared_time_vector():
     a = create_Vec3_table([0.0, 0.1, 0.2], ['x'])
     b = create_Vec3_table([0.0, 0.1, 0.2], ['y'])
@@ -214,16 +225,3 @@ def test_assert_sources_share_times_raises_when_source_hasNoSource():
     sources = [PositionsSource(), NoSource()]
     with pytest.raises(ValueError, match='NoSource'):
         DataSource.assert_sources_share_times(sources)
-
-
-# Test validation of trim_to_range inputs.
-
-def test_init_raises_for_non_tuple_trim_to_range():
-    with pytest.raises(ValueError, match='tuple'):
-        NoSource(trim_to_range=[0.0, 1.0])
-
-
-def test_init_raises_for_wrong_length_trim_to_range():
-    with pytest.raises(ValueError, match='tuple'):
-        NoSource(trim_to_range=(0.0, 0.5, 1.0))
-
