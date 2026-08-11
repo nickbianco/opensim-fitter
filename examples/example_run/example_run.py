@@ -278,8 +278,8 @@ solver = SplineBasedBilevelSolver(unscaled_model,
                                   convergence_tolerance=1e-3,
                                   knot_interval=0.05,
                                   position_weight=1.0,
-                                  body_scale_regularization_weight=1e-2,
-                                  offset_regularization_weight=1e-2)
+                                  body_scale_regularization_weight=1e-1,
+                                  offset_regularization_weight=1e-3)
 solver.add_marker_reference_data(marker_source)
 # Add body scales for each body in the model. Apply the same scales to groups of bodies,
 # including those that should share left-right symmetry.
@@ -301,12 +301,15 @@ solver.add_parameter(BodyScale(['/bodyset/calcn_r', '/bodyset/calcn_l',
                                 '/bodyset/talus_r', '/bodyset/talus_l'],
                                bounds, np.ones(3)))
 # Add marker offset parameters for the tracking markers.
-bounds = Bounds(-0.25, 0.25)
+tracking_bounds = Bounds(-0.25, 0.25)
+anatomical_bounds = Bounds(-0.02, 0.02)
 for i in range(unscaled_model.getMarkerSet().getSize()):
     marker = unscaled_model.getMarkerSet().get(i)
+    path = marker.getAbsolutePathString()
     if not marker.get_fixed():
-        path = marker.getAbsolutePathString()
-        solver.add_parameter(MarkerOffset(path, bounds, np.zeros(3)))
+        solver.add_parameter(MarkerOffset(path, tracking_bounds, np.zeros(3)))
+    elif not path.endswith('JC'):
+        solver.add_parameter(MarkerOffset(path, anatomical_bounds, np.zeros(3)))
 
 # Combine the per-body XYZ body scales from the two scaling stages above by
 # element-wise multiplication.
