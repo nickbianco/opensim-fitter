@@ -51,6 +51,7 @@ class OffsetGroup:
         Absolute model paths to the markers or frames in this group.
     """
     component_paths: list[str]
+    mobod_indexes: list[int]
 
 
 @dataclass
@@ -519,35 +520,7 @@ class BodyScale(Vec3Parameter):
             'BodyScale.apply_to_model is not implemented.')
 
 
-class OffsetParameter(Vec3Parameter):
-    """
-    An optimized Vec3 placement offset shared across one or more markers or frames. The
-    offset is an additive translation, expressed in each component's base frame, applied
-    to the component's placement. Concrete subclasses specify the component type and how
-    the offset is applied into the model.
-    """
-    _component_type: type = None
-    _label: str = 'component'
-
-    def validate(self, mc: ModelCache) -> None:
-        for path in self.paths:
-            component = self._component_type.safeDownCast(mc.model.getComponent(path))
-            if component is None:
-                raise ValueError(
-                    f'Component at path {path} is not a '
-                    f'{self._component_type.__name__}.')
-            parent_frame = component.getParentFrame()
-            base_frame = parent_frame.findBaseFrame()
-            if (parent_frame.getAbsolutePathString() !=
-                    base_frame.getAbsolutePathString()):
-                raise ValueError(
-                    f'Cannot optimize an offset for {self._label} {path}: its parent '
-                    f'frame ({parent_frame.getAbsolutePathString()}) is not its base '
-                    f'frame ({base_frame.getAbsolutePathString()}). Offsets are only '
-                    f'supported for markers/frames attached directly to a body.')
-
-
-class MarkerOffset(OffsetParameter):
+class MarkerOffset(Vec3Parameter):
     """
     An optimized Vec3 offset applied to one or more markers' placement, expressed in
     each marker's base frame. Pass a single marker path to offset one marker, or a list
@@ -563,8 +536,9 @@ class MarkerOffset(OffsetParameter):
         Initial [ox, oy, oz] offset. Defaults to ``None`` (unset).
     """
     group_type = MarkerOffsetGroup
-    _component_type = osim.Marker
-    _label = 'marker'
+    def __init__(self, paths: str | list[str], bounds: Bounds, value: np.ndarray):
+        super().__init__(paths, bounds, value)
+        self.mobod_indexes: list[int] = None
 
     def apply_to_model(self, model: osim.Model) -> None:
         for path in self.paths:
@@ -574,11 +548,29 @@ class MarkerOffset(OffsetParameter):
                 loc[0] + float(self.value[0]), loc[1] + float(self.value[1]),
                 loc[2] + float(self.value[2])))
 
+    def validate(self, mc: ModelCache) -> None:
+        self.mobod_indexes = []
+        for path in self.paths:
+            marker = osim.Marker.safeDownCast(mc.model.getComponent(path))
+            if marker is None:
+                raise ValueError(f'Component at path {path} is not a Marker.')
+            parent_frame = marker.getParentFrame()
+            base_frame = osim.PhysicalFrame.safeDownCast(
+                marker.getParentFrame().findBaseFrame())
+            if (parent_frame.getAbsolutePathString() !=
+                    base_frame.getAbsolutePathString()):
+                raise ValueError(
+                    f'Cannot optimize a marker offset for {path}: its parent '
+                    f'frame ({parent_frame.getAbsolutePathString()}) is not its base '
+                    f'frame ({base_frame.getAbsolutePathString()}). Offsets are only '
+                    f'supported for markers attached directly to a body.')
+            self.mobod_indexes.append(base_frame.getMobilizedBodyIndex())
+
     def to_group(self) -> MarkerOffsetGroup:
-        return MarkerOffsetGroup(list(self.paths))
+        return MarkerOffsetGroup(list(self.paths), list(self.mobod_indexes))
 
 
-class FrameOffset(OffsetParameter):
+class FrameOffset(Vec3Parameter):
     """
     An optimized Vec3 offset applied to one or more `PhysicalOffsetFrame` translations,
     expressed in each frame's base frame. Pass a single frame path to offset one frame,
@@ -594,8 +586,9 @@ class FrameOffset(OffsetParameter):
         Initial [ox, oy, oz] offset. Defaults to ``None`` (unset).
     """
     group_type = FrameOffsetGroup
-    _component_type = osim.PhysicalOffsetFrame
-    _label = 'frame'
+    def __init__(self, paths: str | list[str], bounds: Bounds, value: np.ndarray):
+        super().__init__(paths, bounds, value)
+        self.mobod_indexes: list[int] = None
 
     def apply_to_model(self, model: osim.Model) -> None:
         for path in self.paths:
@@ -605,5 +598,24 @@ class FrameOffset(OffsetParameter):
                 t[0] + float(self.value[0]), t[1] + float(self.value[1]),
                 t[2] + float(self.value[2])))
 
+    def validate(self, mc: ModelCache) -> None:
+        self.mobod_indexes = []
+        for path in self.paths:
+            frame = osim.PhysicalOffsetFrame.safeDownCast(mc.model.getComponent(path))
+            if frame is None:
+                raise ValueError(
+                    f'Component at path {path} is not a PhysicalOffsetFrame.')
+            parent_frame = frame.getParentFrame()
+            base_frame = osim.PhysicalFrame.safeDownCast(
+                frame.getParentFrame().findBaseFrame())
+            if (parent_frame.getAbsolutePathString() !=
+                    base_frame.getAbsolutePathString()):
+                raise ValueError(
+                    f'Cannot optimize a frame offset for {path}: its parent '
+                    f'frame ({parent_frame.getAbsolutePathString()}) is not its base '
+                    f'frame ({base_frame.getAbsolutePathString()}). Offsets are only '
+                    f'supported for markers attached directly to a body.')
+            self.mobod_indexes.append(base_frame.getMobilizedBodyIndex())
+
     def to_group(self) -> FrameOffsetGroup:
-        return FrameOffsetGroup(list(self.paths))
+        return FrameOffsetGroup(list(self.paths), list(self.mobod_indexes))

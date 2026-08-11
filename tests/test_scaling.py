@@ -18,6 +18,12 @@ from osimfit.scaling import (
 )
 from osimfit.data_sources import DataSource
 
+MODEL_FPATH = str(Path(__file__).parent / 'subject_scale_walk.osim')
+
+
+###########
+# HELPERS #
+###########
 
 class PositionsOnlySource(DataSource):
     """
@@ -31,11 +37,6 @@ class PositionsOnlySource(DataSource):
     def _create_positions_table(self):
         return self._positions_table
 
-# Define the test model path.
-MODEL_FPATH = str(Path(__file__).parent / 'subject_scale_walk.osim')
-
-
-# Helper functions.
 
 def load_full_body_model():
     """
@@ -92,7 +93,9 @@ def empty_positions_table():
     return table
 
 
-# Test FrameMeasurement.
+#####################
+# FRAME MEASUREMENT #
+#####################
 
 def test_frame_measurement_same_frame_yields_zero():
     model, state = load_full_body_model()
@@ -117,7 +120,9 @@ def test_frame_measurement_matches_direct_calc():
     assert actual == pytest.approx(expected, rel=1e-12)
 
 
-# Test MarkerMeasurement.
+######################
+# MARKER MEASUREMENT #
+######################
 
 def test_marker_measurement_same_marker_yields_zero():
     model = create_one_body_test_model()
@@ -135,7 +140,9 @@ def test_marker_measurement_returns_offset_distance():
         0.5, abs=1e-12)
 
 
-# Test AnthropometricMeasurement.
+##############################
+# ANTHROPOMETRIC MEASUREMENT #
+##############################
 
 def test_anthropometric_no_axis_returns_mm_magnitude():
     model = create_one_body_test_model()
@@ -170,7 +177,9 @@ def test_anthropometric_z_axis_returns_zero_for_pure_x_offset():
         0.0, abs=1e-9)
 
 
-# Test PositionBasedScaler.
+#########################
+# POSITION-BASED SCALER #
+#########################
 
 def create_position_based_scaler():
     """
@@ -248,7 +257,9 @@ def test_position_based_scaler_add_symmetry_pair_appends_tuple():
     ]
 
 
-# Test AnthropometricBodyScale.
+#############################
+# ANTHROPOMETRIC BODY SCALE #
+#############################
 
 def test_anthropometric_body_scale_applies_expected_scale():
     model = create_one_body_test_model()

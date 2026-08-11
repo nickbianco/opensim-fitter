@@ -1,6 +1,5 @@
 """
-Unit tests for TrackingCostFunction and BilevelCostFunction in
-src/osimfit/callbacks.py.
+Unit tests for TrackingCostFunction and BilevelCostFunction.
 """
 
 import pytest
@@ -17,15 +16,15 @@ from osimfit.model import ModelCache
 MODEL_FPATH = str(Path(__file__).parent / 'subject_scale_walk.osim')
 
 
-# Helper functions.
+###########
+# HELPERS #
+###########
 
-def create_sliding_mass_model(offset_x: float = 0.0):
+def create_sliding_mass_model(child_x_offset: float = 0.0):
     """
-    One body sliding along ground X with two markers in the body frame:
-    m0 at the origin, m1 at (0.5, 0, 0). The q axis is the world X
-    translation. With `offset_x != 0`, the joint's outboard frame on
-    the body (X_BM.p) carries an X translation, so scaling the body's X
-    component multiplies that offset and shifts both markers in Ground.
+    Create a model with ne body sliding along the X-direction in ground with two markers
+    in the body frame: 'm0' at the origin, 'm1' at (0.5, 0, 0). Use `child_x_offset` to
+    add offset in the X-direction for the child body's joint frame.
     """
     model = osim.Model()
     model.setName('sliding_mass')
@@ -35,7 +34,7 @@ def create_sliding_mass_model(offset_x: float = 0.0):
     joint = osim.SliderJoint(
         'slider',
         ground, osim.Vec3(0), osim.Vec3(0),
-        body, osim.Vec3(offset_x, 0, 0), osim.Vec3(0),
+        body, osim.Vec3(child_x_offset, 0, 0), osim.Vec3(0),
     )
     model.addJoint(joint)
     model.addMarker(osim.Marker('m0', body, osim.Vec3(0)))
@@ -44,13 +43,12 @@ def create_sliding_mass_model(offset_x: float = 0.0):
     return model
 
 
-def create_n_sliding_body_model(n: int, offset_x: float = 0.0):
+def create_n_sliding_body_model(n: int, child_x_offset: float = 0.0):
     """
-    n independent bodies, each on its own slider joint from ground along X,
-    each with one marker at body-frame (0.5, 0, 0). Mobilized body indexes
-    are 1..n in body-addition order. `offset_x != 0` gives every joint a
-    non-trivial X_BM translation so body-scale variables produce non-zero
-    sensitivities.
+    Create a model with `n` independent bodies, each on its own slider joint along the
+    X-direction in ground, each with one marker at body-frame (0.5, 0, 0). Mobilized
+    body indexes are 1..n in body-addition order. Use `child_x_offset` to
+    add offset in the X-direction for each child body's joint frame.
     """
     model = osim.Model()
     model.setName(f'{n}_sliding_mass')
@@ -61,7 +59,7 @@ def create_n_sliding_body_model(n: int, offset_x: float = 0.0):
         joint = osim.SliderJoint(
             f'slider_{i}',
             ground, osim.Vec3(0), osim.Vec3(0),
-            body, osim.Vec3(offset_x, 0, 0), osim.Vec3(0),
+            body, osim.Vec3(child_x_offset, 0, 0), osim.Vec3(0),
         )
         model.addJoint(joint)
         model.addMarker(osim.Marker(f'm{i}', body, osim.Vec3(0.5, 0, 0)))
@@ -69,7 +67,16 @@ def create_n_sliding_body_model(n: int, offset_x: float = 0.0):
     return model
 
 
-# Test the TrackingCostFunction interface.
+def getP_BM(model: osim.Model, joint_index: int, state: osim.State):
+    """
+    Return the position of the child frame from the Joint at index `joint_index`.
+    """
+    return model.getJointSet().get(joint_index).getOutboardFrame(state).p().to_numpy()
+
+
+##########################
+# TRACKING COST FUNCTION #
+##########################
 
 def test_tracking_cost_function_constructs_marker_and_frame_subcosts():
     model = osim.Model(MODEL_FPATH)
@@ -86,7 +93,6 @@ def test_tracking_cost_function_add_marker_registers_in_marker_cost():
     cost.add_marker_tracking_cost('/markerset/m0', osim.Vec3(0))
     assert len(cost.marker_cost.markers) == 1
     assert cost.marker_cost.mobod_indexes.size() == 1
-    # frame_cost should be empty.
     assert len(cost.frame_cost.frames) == 0
 
 
@@ -98,11 +104,8 @@ def test_tracking_cost_function_add_frame_registers_in_frame_cost():
         '/bodyset/pelvis', osim.Vec3(0), osim.Quaternion())
     assert len(cost.frame_cost.frames) == 1
     assert cost.frame_cost.mobod_indexes.size() == 1
-    # frame_cost should be empty
     assert len(cost.marker_cost.markers) == 0
 
-
-# Test TrackingCostFunction error calculations.
 
 def test_empty_tracking_cost_function():
     model = osim.Model(MODEL_FPATH)
@@ -132,8 +135,6 @@ def test_tracking_cost_function_marker_off_reference_yields_squared_error():
     x = ca.DM([0.1])
     assert float(cost(x)) == pytest.approx(0.01, abs=1e-9)
 
-
-# Test TrackingCostFunction error Jacobian calculations.
 
 def test_tracking_cost_function_jacobian_sliding_mass():
     model = create_sliding_mass_model()
@@ -175,8 +176,9 @@ def test_tracking_cost_function_jacobian_full_body():
     assert np.allclose(J_jac(0.1).full(), J_fd(0.1).full(), atol=1e-6)
 
 
-
-# Test the BilevelCostFunction interface.
+#########################
+# BILEVEL COST FUNCTION #
+#########################
 
 def test_bilevel_cost_function_constructs_marker_subcost():
     model = create_sliding_mass_model()
@@ -198,6 +200,7 @@ def test_bilevel_cost_function_add_marker_registers_in_marker_cost():
         marker_offset_groups=[], frame_offset_groups=[])
     cost.add_marker_bilevel_cost('/markerset/m0', osim.Vec3(0))
     assert cost.marker_cost.mobod_indexes.size() == 1
+    assert len(cost.frame_cost.frames) == 0
 
 
 def test_bilevel_cost_function_add_frame_registers_in_frame_cost():
@@ -210,43 +213,33 @@ def test_bilevel_cost_function_add_frame_registers_in_frame_cost():
     cost.add_frame_bilevel_cost(
         '/bodyset/body', osim.Vec3(0), osim.Quaternion())
     assert cost.frame_cost.mobod_indexes.size() == 1
-    # marker_cost should be empty.
     assert len(cost.marker_cost.markers) == 0
 
 
-# A helper function for retrieving the outboard frame, `X_BM` of a mobilzed body.
-def getX_BM(model, idx, state):
-    return model.getJointSet().get(idx).getOutboardFrame(state).p().to_numpy()
-
-# Check that BilevelCostFunction routes scale-group values through the per-mobod
-# X_PF / X_BM overrides on the State.
-
-def test_bilevel_apply_scales_writes_xbm_on_target_mobod():
+def test_bilevel_apply_scales_shifts_child_frame_translation():
     """
-    For a body whose joint's outboard frame on the body (X_BM) has a non-trivial
-    translation, applying a Vec3 body scale through the cost should multiply
-    each component of X_BM.p() elementwise on the State.
+    Applying body scales through the cost should multiply each component of the model's
+    child frame translation elementswise.
     """
-    model = create_sliding_mass_model(offset_x=0.4)
+    model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
 
-    state = cost.state
     cost.mc.set_scaled_mobilizer_frame_positions(
-        state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0]))
-    np.testing.assert_allclose(getX_BM(model, 0, state),
+        cost.state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0]))
+    np.testing.assert_allclose(getP_BM(model, 0, cost.state),
                                np.array([0.4 * 2.0, 0.0, 0.0]))
 
 
 def test_bilevel_apply_scales_shared_group_broadcasts_across_members():
     """
-    A shared scale group must apply the same set of factors to every member body's
-    X_BM override on the State.
+    A scale group must apply the same set of scale factors to every member body's
+    child frame translations.
     """
-    model = create_n_sliding_body_model(2, offset_x=0.4)
+    model = create_n_sliding_body_model(2, child_x_offset=0.4)
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
@@ -254,20 +247,18 @@ def test_bilevel_apply_scales_shared_group_broadcasts_across_members():
             ['/bodyset/body_0', '/bodyset/body_1'], [1, 2])],
         marker_offset_groups=[], frame_offset_groups=[])
 
-    state = cost.state
     cost.mc.set_scaled_mobilizer_frame_positions(
-        state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0]))
+        cost.state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0]))
     for k in (0, 1):
-        np.testing.assert_allclose(getX_BM(model, k, state),
+        np.testing.assert_allclose(getP_BM(model, k, cost.state),
                                    np.array([0.4 * 2.0, 0.0, 0.0]))
 
 
 def test_bilevel_apply_scales_mixed_groups_apply_independent_vectors():
     """
-    With both a shared and a solo group, each group's body scales must land on
-    its own member bodies' X_BM overrides independently.
+    Separate scale groups must apply scale factors to owned bodies independently.
     """
-    model = create_n_sliding_body_model(3, offset_x=0.4)
+    model = create_n_sliding_body_model(3, child_x_offset=0.4)
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
@@ -277,17 +268,14 @@ def test_bilevel_apply_scales_mixed_groups_apply_independent_vectors():
         ],
         marker_offset_groups=[], frame_offset_groups=[])
 
-    state = cost.state
     cost.mc.set_scaled_mobilizer_frame_positions(
-        state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0, 5.0, 5.0, 5.0]))
+        cost.state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0, 5.0, 5.0, 5.0]))
     for k in (0, 1):
-        np.testing.assert_allclose(getX_BM(model, k, state),
+        np.testing.assert_allclose(getP_BM(model, k, cost.state),
                                    np.array([0.4 * 2.0, 0.0, 0.0]))
-    np.testing.assert_allclose(getX_BM(model, 2, state),
+    np.testing.assert_allclose(getP_BM(model, 2, cost.state),
                                np.array([0.4 * 5.0, 0.0, 0.0]))
 
-
-# Test BilevelCostFunction error calculations.
 
 def test_bilevel_cost_function_empty_eval_is_zero():
     model = create_sliding_mass_model()
@@ -304,13 +292,10 @@ def test_bilevel_cost_function_empty_eval_is_zero():
 
 def test_bilevel_cost_function_scaling_changes_marker_world_position():
     """
-    With a non-zero outboard offset, scaling the body X by 2.0 shifts the body
-    in Ground (and the markers fixed to it). Specifically, for a SliderJoint
-    whose X_BM = Tx(offset_x), body B's origin in Ground at q=0 is
-    -offset_x * sx. Marker m1 at body-frame (0.5, 0, 0) is then at world
-    (-offset_x * sx + 0.5, 0, 0).
+    Scaling a body changes both the segment length (via offset frame scaling) and the
+    positions of markers on the body.
     """
-    model = create_sliding_mass_model(offset_x=0.4)
+    model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
@@ -324,15 +309,14 @@ def test_bilevel_cost_function_scaling_changes_marker_world_position():
     # At s_unit: m1 world = (-0.4 + 0.5) = 0.1. Error = (0.1 - 0.5)^2 = 0.16.
     assert float(cost(q, s_unit, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
         pytest.approx(0.16, abs=1e-9)
-    # At s_scaled X=2: m1 world = (-0.8 + 0.5) = -0.3. Error = (-0.3 - 0.5)^2 = 0.64.
+    # At s_scaled X=2: m1 world = (-0.8 + 1.0) = 0.2. Error = (0.2 - 0.5)^2 = 0.09.
     assert float(cost(q, s_scaled, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
-        pytest.approx(0.64, abs=1e-9)
+        pytest.approx(0.09, abs=1e-9)
 
 
 def test_bilevel_cost_function_frame_at_reference_yields_zero():
     """
-    A frame tracked at its own world position and orientation (the body frame
-    at q=0 sits at the origin with identity orientation) yields zero error.
+    A frame tracked at its own world position and orientation yields zero error.
     """
     model = create_sliding_mass_model()
     model.initSystem()
@@ -349,14 +333,10 @@ def test_bilevel_cost_function_frame_at_reference_yields_zero():
 
 def test_bilevel_cost_function_scaling_changes_frame_world_position():
     """
-    With a non-zero outboard offset, scaling the body X by 2.0 shifts the body
-    frame in Ground. For a SliderJoint whose X_BM = Tx(offset_x), body B's
-    origin in Ground at q=0 is -offset_x * sx. Tracking that frame against a
-    reference at the world origin with position_weight w gives an error of
-    w * (offset_x * sx)^2 (the orientation stays identity, so it contributes
-    nothing).
+    Scaling a body with a non-zero child frame offset shifts the child frame in ground.
+    The child frame offset should contribute to the squared error in the cost.
     """
-    model = create_sliding_mass_model(offset_x=0.4)
+    model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
@@ -376,10 +356,8 @@ def test_bilevel_cost_function_scaling_changes_frame_world_position():
         pytest.approx(1.28, abs=1e-9)
 
 
-# Test BilevelCostFunction error Jacobian calcluations.
-
 def test_bilevel_cost_function_jacobians_sliding_mass():
-    model = create_sliding_mass_model(offset_x=0.4)
+    model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
     cost_jac = BilevelCostFunction(
         'cost_jac', ModelCache(model),
@@ -471,7 +449,7 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
     columns when both solo scales are set to the same value (chain rule), and
     (b) agree with the finite-difference Jacobian of the shared callback.
     """
-    model = create_n_sliding_body_model(2, offset_x=0.4)
+    model = create_n_sliding_body_model(2, child_x_offset=0.4)
     model.initSystem()
 
     solo_groups = [
@@ -505,18 +483,17 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
 
     nq = len(cost_shared.mc.q_indexes)
     q = ca.SX.sym('q', nq)
-    # Empty offset input.
-    empty = ca.DM.zeros(0, 1)
+    offset = ca.DM.zeros(0, 1)
 
     # (b) Shared analytic ≈ FD on the shared callback.
     s_shared = ca.SX.sym('s_shared', 3)
     x_shared = ca.vertcat(q, s_shared)
     J_shared_fn = ca.Function(
         'J_shared', [x_shared],
-        [ca.jacobian(cost_shared(q, s_shared, empty, empty), x_shared)])
+        [ca.jacobian(cost_shared(q, s_shared, offset, offset), x_shared)])
     J_fd_fn = ca.Function(
         'J_fd', [x_shared],
-        [ca.jacobian(cost_fd(q, s_shared, empty, empty), x_shared)])
+        [ca.jacobian(cost_fd(q, s_shared, offset, offset), x_shared)])
     val_shared = np.concatenate([
         np.full(nq, 0.1),
         np.array([1.1, 1.0, 1.0]),
@@ -531,7 +508,7 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
     x_solo = ca.vertcat(q, s_solo)
     J_solo_fn = ca.Function(
         'J_solo', [x_solo],
-        [ca.jacobian(cost_solo(q, s_solo, empty, empty), x_solo)])
+        [ca.jacobian(cost_solo(q, s_solo, offset, offset), x_solo)])
     val_solo = np.concatenate([
         np.full(nq, 0.1),
         np.array([1.1, 1.0, 1.0, 1.1, 1.0, 1.0]),
@@ -542,21 +519,18 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
                                atol=1e-9)
 
 
-# Test BilevelCostFunction marker/frame offset handling.
-
-def test_bilevel_apply_offsets_shifts_station():
+def test_bilevel_apply_state_shifts_station():
     """
-    apply_offsets sets each offset task's cached station to baseline + offset
-    (absolute, not compounding), leaving non-offset tasks untouched.
+    Use apply_state() to set each offset task's cached station to baseline + offset
+    at identity body scale, leaving non-offset tasks untouched.
     """
     model = create_sliding_mass_model()
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
-        marker_offset_groups=[MarkerOffsetGroup(['/markerset/m1'])],
+        marker_offset_groups=[MarkerOffsetGroup(['/markerset/m1'], [2])],
         frame_offset_groups=[])
-    # m1 (offset group 0) and m0 (no offset).
     cost.add_marker_bilevel_cost('/markerset/m1', osim.Vec3(0.5, 0, 0),
                                  offset_group_index=0)
     cost.add_marker_bilevel_cost('/markerset/m0', osim.Vec3(0, 0, 0))
@@ -564,29 +538,30 @@ def test_bilevel_apply_offsets_shifts_station():
     baseline_m1 = mc.base_stations[0].copy()
     baseline_m0 = mc.base_stations[1].copy()
 
+    body_scale = np.ones(3)
     offset = np.array([0.1, -0.2, 0.3])
-    mc.apply_offsets(offset)
+    mc.apply_state(body_scale, offset)
     np.testing.assert_allclose(mc.stations.getElt(0).to_numpy(),
                                baseline_m1 + offset)
     np.testing.assert_allclose(mc.stations.getElt(1).to_numpy(), baseline_m0)
 
-    # Absolute (not compounding): applying again with the same offset is idempotent.
-    mc.apply_offsets(offset)
+    # apply_state() is idempotent.
+    mc.apply_state(body_scale, offset)
     np.testing.assert_allclose(mc.stations.getElt(0).to_numpy(),
                                baseline_m1 + offset)
 
 
 def test_bilevel_offset_changes_marker_error():
     """
-    Offsetting a marker's station shifts its Ground position (R_GB is identity for
-    the slider), changing the tracking error by the expected amount.
+    Applying an offset to a marker shifts its position and ground and shoudl yield a
+    change in the tracking error.
     """
     model = create_sliding_mass_model()
     model.initSystem()
     cost = BilevelCostFunction(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
-        marker_offset_groups=[MarkerOffsetGroup(['/markerset/m1'])],
+        marker_offset_groups=[MarkerOffsetGroup(['/markerset/m1'], [2])],
         frame_offset_groups=[])
     cost.add_marker_bilevel_cost('/markerset/m1', osim.Vec3(0.5, 0, 0),
                                  offset_group_index=0)
@@ -602,8 +577,8 @@ def test_bilevel_offset_changes_marker_error():
 
 def test_bilevel_offset_frame_orientation_invariant():
     """
-    A translation offset shifts a frame's position but not its orientation, so an
-    orientation-only frame cost (position_weight = 0) is invariant to the offset.
+    Applying a translation offset to frame's position should not affect its orientation,
+    so an orientation-only frame cost (position_weight = 0) is invariant to the offset.
     """
     model = create_sliding_mass_model()
     model.initSystem()
@@ -611,7 +586,7 @@ def test_bilevel_offset_frame_orientation_invariant():
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[],
-        frame_offset_groups=[FrameOffsetGroup(['/bodyset/body'])])
+        frame_offset_groups=[FrameOffsetGroup(['/bodyset/body'], [1])])
     cost.add_frame_bilevel_cost(
         '/bodyset/body', osim.Vec3(0), osim.Quaternion(0.9, 0.1, 0.2, 0.3),
         position_weight=0.0, orientation_weight=1.0, offset_group_index=0)
@@ -625,19 +600,20 @@ def test_bilevel_offset_frame_orientation_invariant():
 
 def test_bilevel_cost_function_offset_jacobians_full_body():
     """
-    On the full-body model (which has rotational DOFs, so R_GB != identity), the
-    analytic bilevel Jacobian over [q, s, o] -- including the marker/frame offset
-    columns and the offset-induced coupling into the q-columns -- must match the
-    finite-difference Jacobian.
+    On the full-body model, the analytic bilevel Jacobian over [q, s, o], including the
+    marker and frame offset columns and the offset-induced coupling into the q-columns,
+    must match the finite-difference Jacobian.
     """
     model = osim.Model(MODEL_FPATH)
     model.initSystem()
     pelvis = osim.Body.safeDownCast(model.getComponent('/bodyset/pelvis'))
-    body_scale_groups = [BodyScaleGroup(
-        ['/bodyset/pelvis'], [int(pelvis.getMobilizedBodyIndex())])]
+    pelvis_mbx = int(pelvis.getMobilizedBodyIndex())
+    torso = osim.Body.safeDownCast(model.getComponent('/bodyset/torso'))
+    torso_mbx = int(torso.getMobilizedBodyIndex())
+    body_scale_groups = [BodyScaleGroup(['/bodyset/pelvis'], [pelvis_mbx])]
 
-    marker_offset_groups = [MarkerOffsetGroup(['/markerset/R.Shoulder'])]
-    frame_offset_groups = [FrameOffsetGroup(['/bodyset/pelvis'])]
+    marker_offset_groups = [MarkerOffsetGroup(['/markerset/R.Shoulder'], [torso_mbx])]
+    frame_offset_groups = [FrameOffsetGroup(['/bodyset/pelvis'], [pelvis_mbx])]
     cost_jac = BilevelCostFunction(
         'cost_jac', ModelCache(model), body_scale_groups=body_scale_groups,
         marker_offset_groups=marker_offset_groups,

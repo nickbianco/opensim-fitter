@@ -1,5 +1,5 @@
 """
-Unit and end-to-end tests for marker/frame XYZ offset optimization in
+Unit and end-to-end tests for marker and frame offset optimization in
 SplineBasedBilevelSolver.
 """
 
@@ -14,6 +14,9 @@ from osimfit.bounds import Bounds
 
 from test_scaled_double_pendulum import create_double_pendulum
 
+###########
+# HELPERS #
+###########
 
 def create_offset_test_model() -> osim.Model:
     """
@@ -37,7 +40,30 @@ def create_offset_test_model() -> osim.Model:
     return model
 
 
-# Registration.
+def create_synthetic_markers(model: osim.Model, trc_path: str,
+                             duration: float = 2.0) -> None:
+    """
+    Forward-simulate `model` and write its marker positions to a TRC file.
+    """
+    state = model.initSystem()
+    manager = osim.Manager(model)
+    manager.setIntegratorFixedStepSize(0.01)
+    manager.initialize(state)
+    manager.integrate(duration)
+    states = manager.getStatesTable()
+
+    controls = osim.TimeSeriesTable(states.getIndependentColumn())
+    output_paths = osim.StdVectorString()
+    output_paths.append('/markerset/.*location')
+    markers = osim.analyzeVec3(model, states, controls, output_paths)
+    markers.addTableMetaDataString('DataRate', '100.0')
+    markers.addTableMetaDataString('Units', 'm')
+    osim.TRCFileAdapter().write(markers, trc_path)
+
+
+################
+# REGISTRATION #
+################
 
 def test_add_marker_offset_registers_single_and_shared_groups():
     model = create_offset_test_model()
@@ -54,7 +80,7 @@ def test_add_marker_offset_registers_single_and_shared_groups():
     assert solver.marker_offsets[0].bounds.upper_bound == 0.02
     # A list argument shares one offset group across the listed markers.
     assert solver.marker_offsets[1].to_group() == MarkerOffsetGroup(
-        ['/markerset/m_body'])
+        ['/markerset/m_body'], [1])
 
 
 def test_add_frame_offset_registers():
@@ -90,7 +116,9 @@ def test_add_frame_offset_rejects_non_offset_frame():
             FrameOffset('/bodyset/body', Bounds(-0.02, 0.02), np.zeros(3)))
 
 
-# update_model baking.
+################
+# UPDATE MODEL #
+################
 
 def test_update_model_bakes_marker_and_frame_offsets():
     model = create_offset_test_model()
@@ -119,39 +147,9 @@ def test_update_model_bakes_marker_and_frame_offsets():
         pof.get_translation().to_numpy(), np.array([0.1, 0, 0]) + [0.05, 0.0, -0.1])
 
 
-# End-to-end recovery.
-
-def _synthesize_markers(model: osim.Model, trc_path: str,
-                        duration: float = 2.0) -> None:
-    """
-    Forward-simulate `model` and write its marker positions to a TRC file.
-    """
-    state = model.initSystem()
-    manager = osim.Manager(model)
-    manager.setIntegratorFixedStepSize(0.01)
-    manager.initialize(state)
-    manager.integrate(duration)
-    states = manager.getStatesTable()
-
-    controls = osim.TimeSeriesTable(states.getIndependentColumn())
-    output_paths = osim.StdVectorString()
-    output_paths.append('/markerset/.*location')
-    markers = osim.analyzeVec3(model, states, controls, output_paths)
-    markers.addTableMetaDataString('DataRate', '100.0')
-    markers.addTableMetaDataString('Units', 'm')
-    osim.TRCFileAdapter().write(markers, trc_path)
-
-
-def _add_b1_anchor_marker(model: osim.Model) -> None:
-    """
-    Add a second, non-offset marker to body b1 so that b1's pose is observable
-    independently of the m1 offset (otherwise a constant q1 rotation trades off
-    against the offset direction and the offset is not uniquely identifiable).
-    """
-    b1 = osim.Body.safeDownCast(model.getComponent('/bodyset/b1'))
-    model.addMarker(osim.Marker('m2', b1, osim.Vec3(0.5, 0, 0)))
-    model.finalizeConnections()
-
+####################
+# END-TO-END TESTS #
+####################
 
 def test_pendulum_bilevel_recovers_marker_offset(tmp_path):
     """
@@ -159,10 +157,14 @@ def test_pendulum_bilevel_recovers_marker_offset(tmp_path):
     body-frame offset, then solve against a model with that marker at its nominal
     location while optimizing its offset. The recovered offset must match the truth.
     """
-    true_offset = np.array([0.1, 0.05, 0.0])
+    def add_b1_anchor_marker(model: osim.Model) -> None:
+        b1 = osim.Body.safeDownCast(model.getComponent('/bodyset/b1'))
+        model.addMarker(osim.Marker('m2', b1, osim.Vec3(0.5, 0, 0)))
+        model.finalizeConnections()
 
+    true_offset = np.array([0.1, 0.05, 0.0])
     truth = create_double_pendulum(1.0, 1.0)
-    _add_b1_anchor_marker(truth)
+    add_b1_anchor_marker(truth)
     truth.initSystem()
     m1 = osim.Marker.safeDownCast(truth.getComponent('/markerset/m1'))
     m1.set_location(osim.Vec3(*[float(v) for v in true_offset]))
@@ -170,14 +172,14 @@ def test_pendulum_bilevel_recovers_marker_offset(tmp_path):
     truth.initSystem()
 
     trc_path = str(tmp_path / 'markers.trc')
-    _synthesize_markers(truth, trc_path)
+    create_synthetic_markers(truth, trc_path)
 
     raw_labels = osim.TimeSeriesTableVec3(trc_path).getColumnLabels()
     label_map = {label: label.replace('|location', '') for label in raw_labels}
 
     # Solve against the nominal model (m1 at the body origin).
     model = create_double_pendulum(1.0, 1.0)
-    _add_b1_anchor_marker(model)
+    add_b1_anchor_marker(model)
     model.initSystem()
     marker_source = MarkerSource(trc_path, label_map=label_map)
 

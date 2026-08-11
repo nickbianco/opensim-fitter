@@ -16,6 +16,10 @@ from osimfit.model import BodyScale
 from osimfit.bounds import Bounds
 
 
+###########
+# HELPERS #
+###########
+
 def create_double_pendulum(length1: float, length2: float) -> osim.Model:
     """
     Build a double-pendulum model with the given body lengths.
@@ -74,6 +78,10 @@ def create_synthetic_markers_file(trc_path: str, length1: float,
     markers.addTableMetaDataString('Units', 'm')
     osim.TRCFileAdapter().write(markers, trc_path)
 
+
+##################
+# PENDULUM TESTS #
+##################
 
 def test_pendulum_bilevel_recovers_ground_truth_lengths(tmp_path):
     """

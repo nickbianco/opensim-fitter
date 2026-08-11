@@ -369,6 +369,15 @@ class MarkerSource(DataSource):
                 f"Marker labels in {self.trc_filepath} are not all present in "
                 f"{model.getName()}. Missing from model: {missing_in_model}.")
 
+    def write(self, trc_filename: str):
+        markers = self.get_positions_table()
+        marker_names = osim.StdVectorString()
+        for label in markers.getColumnLabels():
+            marker_names.append(label.replace('/markerset/', ''))
+        markers.setColumnLabels(marker_names)
+        trc = osim.TRCFileAdapter()
+        trc.write(markers, trc_filename)
+
 
 class TheiaFrameSource(DataSource):
     """
