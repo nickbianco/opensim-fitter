@@ -1,6 +1,6 @@
 """
 Unit and end-to-end tests for marker and frame offset optimization in
-SplineBasedBilevelSolver.
+SplinedKinematicsSolver.
 """
 
 import pytest
@@ -8,8 +8,9 @@ import numpy as np
 import opensim as osim
 
 from osimfit.data_sources import MarkerSource
-from osimfit.solvers import SplineBasedBilevelSolver, SplineBilevelSolution
+from osimfit.solvers import SplinedKinematicsSolver, SplinedKinematicsSolution
 from osimfit.model import MarkerOffsetGroup, MarkerOffset, FrameOffset
+from osimfit.costs import OffsetRegularizationCost
 from osimfit.bounds import Bounds
 
 from test_scaled_double_pendulum import create_double_pendulum
@@ -68,7 +69,7 @@ def create_synthetic_markers(model: osim.Model, trc_path: str,
 def test_add_marker_offset_registers_single_and_shared_groups():
     model = create_offset_test_model()
     model.initSystem()
-    solver = SplineBasedBilevelSolver(model)
+    solver = SplinedKinematicsSolver(model)
     solver.add_parameter(
         MarkerOffset('/markerset/m_body', Bounds(-0.02, 0.02), np.zeros(3)))
     solver.add_parameter(
@@ -86,7 +87,7 @@ def test_add_marker_offset_registers_single_and_shared_groups():
 def test_add_frame_offset_registers():
     model = create_offset_test_model()
     model.initSystem()
-    solver = SplineBasedBilevelSolver(model)
+    solver = SplinedKinematicsSolver(model)
     solver.add_parameter(
         FrameOffset('/bodyset/body/pof', Bounds(-0.03, 0.03), np.zeros(3)))
 
@@ -97,7 +98,7 @@ def test_add_frame_offset_registers():
 def test_add_marker_offset_rejects_empty_and_parent_not_base():
     model = create_offset_test_model()
     model.initSystem()
-    solver = SplineBasedBilevelSolver(model)
+    solver = SplinedKinematicsSolver(model)
     with pytest.raises(ValueError, match='non-empty'):
         solver.add_parameter(MarkerOffset([], Bounds(-0.02, 0.02), np.zeros(3)))
     # A marker on an offset frame (parent frame != base frame) is rejected.
@@ -109,7 +110,7 @@ def test_add_marker_offset_rejects_empty_and_parent_not_base():
 def test_add_frame_offset_rejects_non_offset_frame():
     model = create_offset_test_model()
     model.initSystem()
-    solver = SplineBasedBilevelSolver(model)
+    solver = SplinedKinematicsSolver(model)
     # A Body is not a PhysicalOffsetFrame, so it has no translation to offset.
     with pytest.raises(ValueError, match='PhysicalOffsetFrame'):
         solver.add_parameter(
@@ -123,9 +124,9 @@ def test_add_frame_offset_rejects_non_offset_frame():
 def test_update_model_bakes_marker_and_frame_offsets():
     model = create_offset_test_model()
     model.initSystem()
-    solver = SplineBasedBilevelSolver(model)
+    solver = SplinedKinematicsSolver(model)
 
-    solution = SplineBilevelSolution(
+    solution = SplinedKinematicsSolution(
         states_table=None,
         parameters=[
             MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0),
@@ -145,6 +146,56 @@ def test_update_model_bakes_marker_and_frame_offsets():
         updated.getComponent('/bodyset/body/pof'))
     np.testing.assert_allclose(
         pof.get_translation().to_numpy(), np.array([0.1, 0, 0]) + [0.05, 0.0, -0.1])
+
+
+####################
+# GUESS VALIDATION #
+####################
+
+def _make_offset_solver_and_states_table(tmp_path):
+    """
+    Build a SplinedKinematicsSolver on the offset test model with a marker offset and a
+    frame offset registered (canonical order), plus a states_table matching the
+    reference data's time samples for use as a guess.
+    """
+    trc_path = str(tmp_path / 'markers.trc')
+    create_synthetic_markers(create_offset_test_model(), trc_path)
+    raw_labels = osim.TimeSeriesTableVec3(trc_path).getColumnLabels()
+    label_map = {label: label.replace('|location', '') for label in raw_labels}
+    marker_source = MarkerSource(trc_path, label_map=label_map)
+
+    solver = SplinedKinematicsSolver(create_offset_test_model())
+    solver.add_marker_reference_data(marker_source)
+    solver.add_parameter(
+        MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)))
+    solver.add_parameter(
+        FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)))
+
+    times = solver.get_times_from_reference_data()
+    coords = np.zeros((len(times), len(solver.coordinate_indexes)))
+    states_table = SplinedKinematicsSolution.create_states_table(
+        solver.mc.model, solver.state, solver.coordinate_indexes, times, coords)
+    return solver, states_table
+
+
+def test_validate_guess_accepts_canonical_parameter_order(tmp_path):
+    solver, states_table = _make_offset_solver_and_states_table(tmp_path)
+    guess = SplinedKinematicsSolution(states_table=states_table, parameters=[
+        MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)),
+        FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)),
+    ])
+    solver._validate_guess(guess)  # canonical order: no raise
+
+
+def test_validate_guess_rejects_out_of_order_parameters(tmp_path):
+    solver, states_table = _make_offset_solver_and_states_table(tmp_path)
+    # frame_offsets before marker_offsets violates CostInput.INPUT_ORDER.
+    guess = SplinedKinematicsSolution(states_table=states_table, parameters=[
+        FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)),
+        MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)),
+    ])
+    with pytest.raises(ValueError, match='ordered by CostInput.INPUT_ORDER'):
+        solver._validate_guess(guess)
 
 
 ####################
@@ -183,10 +234,11 @@ def test_pendulum_bilevel_recovers_marker_offset(tmp_path):
     model.initSystem()
     marker_source = MarkerSource(trc_path, label_map=label_map)
 
-    solver = SplineBasedBilevelSolver(
+    solver = SplinedKinematicsSolver(
         model, convergence_tolerance=1e-5, knot_interval=0.05,
-        position_weight=5.0, offset_regularization_weight=1e-4)
+        position_weight=5.0)
     solver.add_marker_reference_data(marker_source)
+    solver.add_cost(OffsetRegularizationCost(1e-4))
     solver.add_parameter(
         MarkerOffset('/markerset/m1', Bounds(-0.5, 0.5), np.zeros(3)))
 

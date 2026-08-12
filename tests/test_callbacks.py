@@ -10,6 +10,7 @@ from pathlib import Path
 from osimfit.callbacks import (BilevelCostFunction, BodyScaleGroup,
                                MarkerOffsetGroup, FrameOffsetGroup,
                                TrackingCostFunction)
+from osimfit.costs import CostInput
 from osimfit.model import ModelCache
 
 # Define the test model path.
@@ -74,45 +75,57 @@ def getP_BM(model: osim.Model, joint_index: int, state: osim.State):
     return model.getJointSet().get(joint_index).getOutboardFrame(state).p().to_numpy()
 
 
+def build_bilevel_cost(name, mc, body_scale_groups=[], marker_offset_groups=[],
+                       frame_offset_groups=[], opts={}):
+    """
+    Register the given parameter groups on `mc` and build a BilevelCostFunction, which
+    reads its groups from the ModelCache.
+    """
+    mc.body_scale_groups = list(body_scale_groups)
+    mc.marker_offset_groups = list(marker_offset_groups)
+    mc.frame_offset_groups = list(frame_offset_groups)
+    return BilevelCostFunction(name, mc, opts=opts)
+
+
 ##########################
 # TRACKING COST FUNCTION #
 ##########################
 
-def test_tracking_cost_function_constructs_marker_and_frame_subcosts():
+def test_tracking_cost_function_constructs_marker_and_frame_terms():
     model = osim.Model(MODEL_FPATH)
     model.initSystem()
     cost = TrackingCostFunction('cost', ModelCache(model))
-    assert cost.marker_cost is not None
-    assert cost.frame_cost is not None
+    assert cost.marker_term is not None
+    assert cost.frame_term is not None
 
 
-def test_tracking_cost_function_add_marker_registers_in_marker_cost():
+def test_tracking_cost_function_add_marker_registers_in_marker_term():
     model = create_sliding_mass_model()
     model.initSystem()
     cost = TrackingCostFunction('cost', ModelCache(model))
-    cost.add_marker_tracking_cost('/markerset/m0', osim.Vec3(0))
-    assert len(cost.marker_cost.markers) == 1
-    assert cost.marker_cost.mobod_indexes.size() == 1
-    assert len(cost.frame_cost.frames) == 0
+    cost.add_marker_tracking_cost_term('/markerset/m0', osim.Vec3(0))
+    assert len(cost.marker_term.markers) == 1
+    assert cost.marker_term.mobod_indexes.size() == 1
+    assert len(cost.frame_term.frames) == 0
 
 
-def test_tracking_cost_function_add_frame_registers_in_frame_cost():
+def test_tracking_cost_function_add_frame_registers_in_frame_term():
     model = osim.Model(MODEL_FPATH)
     model.initSystem()
     cost = TrackingCostFunction('cost', ModelCache(model))
-    cost.add_frame_tracking_cost(
+    cost.add_frame_tracking_cost_term(
         '/bodyset/pelvis', osim.Vec3(0), osim.Quaternion())
-    assert len(cost.frame_cost.frames) == 1
-    assert cost.frame_cost.mobod_indexes.size() == 1
-    assert len(cost.marker_cost.markers) == 0
+    assert len(cost.frame_term.frames) == 1
+    assert cost.frame_term.mobod_indexes.size() == 1
+    assert len(cost.marker_term.markers) == 0
 
 
 def test_empty_tracking_cost_function():
     model = osim.Model(MODEL_FPATH)
     model.initSystem()
     cost = TrackingCostFunction('cost', ModelCache(model))
-    x = ca.DM.zeros(len(cost.mc.q_indexes))
-    assert float(cost(x)) == pytest.approx(0.0, abs=1e-12)
+    x = ca.DM.zeros(len(cost.mc.coordinate_indexes))
+    assert float(cost(CostInput(coordinates=x))) == pytest.approx(0.0, abs=1e-12)
 
 
 def test_tracking_cost_function_marker_at_reference_yields_zero():
@@ -120,9 +133,9 @@ def test_tracking_cost_function_marker_at_reference_yields_zero():
     model.initSystem()
     cost = TrackingCostFunction('cost', ModelCache(model))
     # At q=0, m0 sits at the world origin.
-    cost.add_marker_tracking_cost('/markerset/m0', osim.Vec3(0))
-    x = ca.DM.zeros(len(cost.mc.q_indexes))
-    assert float(cost(x)) == pytest.approx(0.0, abs=1e-12)
+    cost.add_marker_tracking_cost_term('/markerset/m0', osim.Vec3(0))
+    x = ca.DM.zeros(len(cost.mc.coordinate_indexes))
+    assert float(cost(CostInput(coordinates=x))) == pytest.approx(0.0, abs=1e-12)
 
 
 def test_tracking_cost_function_marker_off_reference_yields_squared_error():
@@ -130,10 +143,10 @@ def test_tracking_cost_function_marker_off_reference_yields_squared_error():
     model.initSystem()
     cost = TrackingCostFunction('cost', ModelCache(model))
     # m0 at world (0.1, 0, 0) when q=0.1; reference at the origin.
-    cost.add_marker_tracking_cost(
+    cost.add_marker_tracking_cost_term(
         '/markerset/m0', osim.Vec3(0.0, 0, 0), weight=1.0)
     x = ca.DM([0.1])
-    assert float(cost(x)) == pytest.approx(0.01, abs=1e-9)
+    assert float(cost(CostInput(coordinates=x))) == pytest.approx(0.01, abs=1e-9)
 
 
 def test_tracking_cost_function_jacobian_sliding_mass():
@@ -144,14 +157,14 @@ def test_tracking_cost_function_jacobian_sliding_mass():
                                    opts={'enable_fd': True})
 
     for cost in (cost_jac, cost_fd):
-        cost.add_marker_tracking_cost(
+        cost.add_marker_tracking_cost_term(
             '/markerset/m0', osim.Vec3(0.3, 0, 0), weight=2.0)
-        cost.add_marker_tracking_cost(
+        cost.add_marker_tracking_cost_term(
             '/markerset/m1', osim.Vec3(0.7, 0, 0), weight=1.5)
 
-    x = ca.SX.sym('x', len(cost_jac.mc.q_indexes))
-    J_jac = ca.Function('J_jac', [x], [ca.jacobian(cost_jac(x), x)])
-    J_fd = ca.Function('J_fd', [x], [ca.jacobian(cost_fd(x), x)])
+    x = ca.SX.sym('x', len(cost_jac.mc.coordinate_indexes))
+    J_jac = ca.Function('J_jac', [x], [ca.jacobian(cost_jac(CostInput(x)), x)])
+    J_fd = ca.Function('J_fd', [x], [ca.jacobian(cost_fd(CostInput(x)), x)])
 
     assert np.allclose(J_jac(0.1).full(), J_fd(0.1).full(), atol=1e-6)
 
@@ -164,14 +177,14 @@ def test_tracking_cost_function_jacobian_full_body():
                                    opts={'enable_fd': True})
 
     for cost in (cost_jac, cost_fd):
-        cost.add_marker_tracking_cost(
+        cost.add_marker_tracking_cost_term(
             '/markerset/R.Shoulder', osim.Vec3(0.3, 0, 0), weight=2.0)
-        cost.add_marker_tracking_cost(
+        cost.add_marker_tracking_cost_term(
             '/markerset/L.ASIS', osim.Vec3(0.7, 0, 0), weight=1.5)
 
-    x = ca.SX.sym('x', len(cost_jac.mc.q_indexes))
-    J_jac = ca.Function('J_jac', [x], [ca.jacobian(cost_jac(x), x)])
-    J_fd = ca.Function('J_fd', [x], [ca.jacobian(cost_fd(x), x)])
+    x = ca.SX.sym('x', len(cost_jac.mc.coordinate_indexes))
+    J_jac = ca.Function('J_jac', [x], [ca.jacobian(cost_jac(CostInput(x)), x)])
+    J_fd = ca.Function('J_fd', [x], [ca.jacobian(cost_fd(CostInput(x)), x)])
 
     assert np.allclose(J_jac(0.1).full(), J_fd(0.1).full(), atol=1e-6)
 
@@ -180,40 +193,40 @@ def test_tracking_cost_function_jacobian_full_body():
 # BILEVEL COST FUNCTION #
 #########################
 
-def test_bilevel_cost_function_constructs_marker_subcost():
+def test_bilevel_cost_function_constructs_marker_term():
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    assert cost.marker_cost is not None
-    assert cost.body_scale_groups == [BodyScaleGroup(['/bodyset/body'], [1])]
+    assert cost.marker_term is not None
+    assert cost.mc.body_scale_groups == [BodyScaleGroup(['/bodyset/body'], [1])]
 
 
-def test_bilevel_cost_function_add_marker_registers_in_marker_cost():
+def test_bilevel_cost_function_add_marker_registers_in_marker_term():
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    cost.add_marker_bilevel_cost('/markerset/m0', osim.Vec3(0))
-    assert cost.marker_cost.mobod_indexes.size() == 1
-    assert len(cost.frame_cost.frames) == 0
+    cost.add_marker_bilevel_cost_term('/markerset/m0', osim.Vec3(0))
+    assert cost.marker_term.mobod_indexes.size() == 1
+    assert len(cost.frame_term.frames) == 0
 
 
-def test_bilevel_cost_function_add_frame_registers_in_frame_cost():
+def test_bilevel_cost_function_add_frame_registers_in_frame_term():
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    cost.add_frame_bilevel_cost(
+    cost.add_frame_bilevel_cost_term(
         '/bodyset/body', osim.Vec3(0), osim.Quaternion())
-    assert cost.frame_cost.mobod_indexes.size() == 1
-    assert len(cost.marker_cost.markers) == 0
+    assert cost.frame_term.mobod_indexes.size() == 1
+    assert len(cost.marker_term.markers) == 0
 
 
 def test_bilevel_apply_scales_shifts_child_frame_translation():
@@ -223,13 +236,13 @@ def test_bilevel_apply_scales_shifts_child_frame_translation():
     """
     model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
 
     cost.mc.set_scaled_mobilizer_frame_positions(
-        cost.state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0]))
+        cost.state, np.array([2.0, 3.0, 4.0]))
     np.testing.assert_allclose(getP_BM(model, 0, cost.state),
                                np.array([0.4 * 2.0, 0.0, 0.0]))
 
@@ -241,14 +254,14 @@ def test_bilevel_apply_scales_shared_group_broadcasts_across_members():
     """
     model = create_n_sliding_body_model(2, child_x_offset=0.4)
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(
             ['/bodyset/body_0', '/bodyset/body_1'], [1, 2])],
         marker_offset_groups=[], frame_offset_groups=[])
 
     cost.mc.set_scaled_mobilizer_frame_positions(
-        cost.state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0]))
+        cost.state, np.array([2.0, 3.0, 4.0]))
     for k in (0, 1):
         np.testing.assert_allclose(getP_BM(model, k, cost.state),
                                    np.array([0.4 * 2.0, 0.0, 0.0]))
@@ -260,7 +273,7 @@ def test_bilevel_apply_scales_mixed_groups_apply_independent_vectors():
     """
     model = create_n_sliding_body_model(3, child_x_offset=0.4)
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[
             BodyScaleGroup(['/bodyset/body_0', '/bodyset/body_1'], [1, 2]),
@@ -269,7 +282,7 @@ def test_bilevel_apply_scales_mixed_groups_apply_independent_vectors():
         marker_offset_groups=[], frame_offset_groups=[])
 
     cost.mc.set_scaled_mobilizer_frame_positions(
-        cost.state, cost.body_scale_groups, np.array([2.0, 3.0, 4.0, 5.0, 5.0, 5.0]))
+        cost.state, np.array([2.0, 3.0, 4.0, 5.0, 5.0, 5.0]))
     for k in (0, 1):
         np.testing.assert_allclose(getP_BM(model, k, cost.state),
                                    np.array([0.4 * 2.0, 0.0, 0.0]))
@@ -280,13 +293,13 @@ def test_bilevel_apply_scales_mixed_groups_apply_independent_vectors():
 def test_bilevel_cost_function_empty_eval_is_zero():
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    q = ca.DM.zeros(len(cost.mc.q_indexes))
+    q = ca.DM.zeros(len(cost.mc.coordinate_indexes))
     s = ca.DM.ones(3)
-    assert float(cost(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.0, abs=1e-12)
 
 
@@ -297,20 +310,20 @@ def test_bilevel_cost_function_scaling_changes_marker_world_position():
     """
     model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    cost.add_marker_bilevel_cost('/markerset/m1', osim.Vec3(0.5, 0, 0))
+    cost.add_marker_bilevel_cost_term('/markerset/m1', osim.Vec3(0.5, 0, 0))
 
-    q = ca.DM.zeros(len(cost.mc.q_indexes))
+    q = ca.DM.zeros(len(cost.mc.coordinate_indexes))
     s_unit = ca.DM([1.0, 1.0, 1.0])
     s_scaled = ca.DM([2.0, 1.0, 1.0])
     # At s_unit: m1 world = (-0.4 + 0.5) = 0.1. Error = (0.1 - 0.5)^2 = 0.16.
-    assert float(cost(q, s_unit, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s_unit, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.16, abs=1e-9)
     # At s_scaled X=2: m1 world = (-0.8 + 1.0) = 0.2. Error = (0.2 - 0.5)^2 = 0.09.
-    assert float(cost(q, s_scaled, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s_scaled, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.09, abs=1e-9)
 
 
@@ -320,14 +333,14 @@ def test_bilevel_cost_function_frame_at_reference_yields_zero():
     """
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    cost.add_frame_bilevel_cost('/bodyset/body', osim.Vec3(0), osim.Quaternion())
-    q = ca.DM.zeros(len(cost.mc.q_indexes))
+    cost.add_frame_bilevel_cost_term('/bodyset/body', osim.Vec3(0), osim.Quaternion())
+    q = ca.DM.zeros(len(cost.mc.coordinate_indexes))
     s = ca.DM([1.0, 1.0, 1.0])
-    assert float(cost(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.0, abs=1e-12)
 
 
@@ -338,59 +351,59 @@ def test_bilevel_cost_function_scaling_changes_frame_world_position():
     """
     model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    cost.add_frame_bilevel_cost(
+    cost.add_frame_bilevel_cost_term(
         '/bodyset/body', osim.Vec3(0), osim.Quaternion(), position_weight=2.0)
 
-    q = ca.DM.zeros(len(cost.mc.q_indexes))
+    q = ca.DM.zeros(len(cost.mc.coordinate_indexes))
     s_unit = ca.DM([1.0, 1.0, 1.0])
     s_scaled = ca.DM([2.0, 1.0, 1.0])
     # At s_unit: origin = -0.4. Error = 2 * (-0.4)^2 = 0.32.
-    assert float(cost(q, s_unit, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s_unit, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.32, abs=1e-9)
     # At s_scaled X=2: origin = -0.8. Error = 2 * (-0.8)^2 = 1.28.
-    assert float(cost(q, s_scaled, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s_scaled, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)))) == \
         pytest.approx(1.28, abs=1e-9)
 
 
 def test_bilevel_cost_function_jacobians_sliding_mass():
     model = create_sliding_mass_model(child_x_offset=0.4)
     model.initSystem()
-    cost_jac = BilevelCostFunction(
+    cost_jac = build_bilevel_cost(
         'cost_jac', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[])
-    cost_fd = BilevelCostFunction(
+    cost_fd = build_bilevel_cost(
         'cost_fd', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[], frame_offset_groups=[],
         opts={'enable_fd': True})
 
     for cost in (cost_jac, cost_fd):
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/m0', osim.Vec3(0.3, 0, 0), weight=2.0)
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/m1', osim.Vec3(0.7, 0, 0), weight=1.5)
-        cost.add_frame_bilevel_cost(
+        cost.add_frame_bilevel_cost_term(
             '/bodyset/body', osim.Vec3(0.5, 0, 0), osim.Quaternion(),
             position_weight=1.5, orientation_weight=1.0)
 
-    q = ca.SX.sym('q', len(cost_jac.mc.q_indexes))
+    q = ca.SX.sym('q', len(cost_jac.mc.coordinate_indexes))
     s = ca.SX.sym('s', 3)
     x = ca.vertcat(q, s)
 
     J_jac = ca.Function(
         'J_jac', [x],
-        [ca.jacobian(cost_jac(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)), x)])
+        [ca.jacobian(cost_jac(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))), x)])
     J_fd = ca.Function(
         'J_fd', [x],
-        [ca.jacobian(cost_fd(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)), x)])
+        [ca.jacobian(cost_fd(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))), x)])
 
     val = np.concatenate([
-        np.full(len(cost_jac.mc.q_indexes), 0.1),
+        np.full(len(cost_jac.mc.coordinate_indexes), 0.1),
         np.array([1.1, 1.0, 1.0]),
     ])
     assert np.allclose(J_jac(val).full(), J_fd(val).full(), atol=1e-6)
@@ -407,36 +420,36 @@ def test_bilevel_cost_function_jacobians_full_body():
             body_paths=[body.getAbsolutePathString()],
             mobod_indexes=[int(body.getMobilizedBodyIndex())]))
 
-    cost_jac = BilevelCostFunction(
+    cost_jac = build_bilevel_cost(
         'cost_jac', ModelCache(model), body_scale_groups=body_scale_groups,
         marker_offset_groups=[], frame_offset_groups=[])
-    cost_fd = BilevelCostFunction(
+    cost_fd = build_bilevel_cost(
         'cost_fd', ModelCache(model), body_scale_groups=body_scale_groups,
         marker_offset_groups=[], frame_offset_groups=[], opts={'enable_fd': True})
 
     for cost in (cost_jac, cost_fd):
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/R.Shoulder', osim.Vec3(0.3, 0, 0), weight=2.0)
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/L.ASIS', osim.Vec3(0.7, 0, 0), weight=1.5)
-        cost.add_frame_bilevel_cost(
+        cost.add_frame_bilevel_cost_term(
             '/bodyset/pelvis', osim.Vec3(0.3, 0.1, -0.2),
             osim.Quaternion(0.9, 0.1, 0.2, 0.3),
             position_weight=2.0, orientation_weight=1.5)
 
-    q = ca.SX.sym('q', len(cost_jac.mc.q_indexes))
+    q = ca.SX.sym('q', len(cost_jac.mc.coordinate_indexes))
     s = ca.SX.sym('s', 3*bodyset.getSize())
     x = ca.vertcat(q, s)
 
     J_jac = ca.Function(
         'J_jac', [x],
-        [ca.jacobian(cost_jac(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)), x)])
+        [ca.jacobian(cost_jac(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))), x)])
     J_fd = ca.Function(
         'J_fd', [x],
-        [ca.jacobian(cost_fd(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1)), x)])
+        [ca.jacobian(cost_fd(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(0, 1))), x)])
 
     val = np.concatenate([
-        np.full(len(cost_jac.mc.q_indexes), 0.1),
+        np.full(len(cost_jac.mc.coordinate_indexes), 0.1),
         np.tile([1.1, 1.0, 1.0], bodyset.getSize()),
     ])
     assert np.allclose(J_jac(val).full(), J_fd(val).full(), atol=1e-6)
@@ -459,29 +472,29 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
     shared_groups = [
         BodyScaleGroup(['/bodyset/body_0', '/bodyset/body_1'], [1, 2]),
     ]
-    cost_solo = BilevelCostFunction(
+    cost_solo = build_bilevel_cost(
         'cost_solo', ModelCache(model), body_scale_groups=solo_groups,
         marker_offset_groups=[], frame_offset_groups=[])
-    cost_shared = BilevelCostFunction(
+    cost_shared = build_bilevel_cost(
         'cost_shared', ModelCache(model), body_scale_groups=shared_groups,
         marker_offset_groups=[], frame_offset_groups=[])
-    cost_fd = BilevelCostFunction(
+    cost_fd = build_bilevel_cost(
         'cost_fd', ModelCache(model), body_scale_groups=shared_groups,
         marker_offset_groups=[], frame_offset_groups=[], opts={'enable_fd': True})
 
     for cost in (cost_solo, cost_shared, cost_fd):
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/m0', osim.Vec3(0.4, 0, 0), weight=2.0)
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/m1', osim.Vec3(0.7, 0, 0), weight=1.5)
-        cost.add_frame_bilevel_cost(
+        cost.add_frame_bilevel_cost_term(
             '/bodyset/body_0', osim.Vec3(0.2, 0, 0), osim.Quaternion(),
             position_weight=1.0)
-        cost.add_frame_bilevel_cost(
+        cost.add_frame_bilevel_cost_term(
             '/bodyset/body_1', osim.Vec3(0.5, 0, 0), osim.Quaternion(),
             position_weight=1.2)
 
-    nq = len(cost_shared.mc.q_indexes)
+    nq = len(cost_shared.mc.coordinate_indexes)
     q = ca.SX.sym('q', nq)
     offset = ca.DM.zeros(0, 1)
 
@@ -490,10 +503,10 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
     x_shared = ca.vertcat(q, s_shared)
     J_shared_fn = ca.Function(
         'J_shared', [x_shared],
-        [ca.jacobian(cost_shared(q, s_shared, offset, offset), x_shared)])
+        [ca.jacobian(cost_shared(CostInput(q, s_shared, offset, offset)), x_shared)])
     J_fd_fn = ca.Function(
         'J_fd', [x_shared],
-        [ca.jacobian(cost_fd(q, s_shared, offset, offset), x_shared)])
+        [ca.jacobian(cost_fd(CostInput(q, s_shared, offset, offset)), x_shared)])
     val_shared = np.concatenate([
         np.full(nq, 0.1),
         np.array([1.1, 1.0, 1.0]),
@@ -508,7 +521,7 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
     x_solo = ca.vertcat(q, s_solo)
     J_solo_fn = ca.Function(
         'J_solo', [x_solo],
-        [ca.jacobian(cost_solo(q, s_solo, offset, offset), x_solo)])
+        [ca.jacobian(cost_solo(CostInput(q, s_solo, offset, offset)), x_solo)])
     val_solo = np.concatenate([
         np.full(nq, 0.1),
         np.array([1.1, 1.0, 1.0, 1.1, 1.0, 1.0]),
@@ -526,28 +539,28 @@ def test_bilevel_apply_state_shifts_station():
     """
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[MarkerOffsetGroup(['/markerset/m1'], [2])],
         frame_offset_groups=[])
-    cost.add_marker_bilevel_cost('/markerset/m1', osim.Vec3(0.5, 0, 0),
+    cost.add_marker_bilevel_cost_term('/markerset/m1', osim.Vec3(0.5, 0, 0),
                                  offset_group_index=0)
-    cost.add_marker_bilevel_cost('/markerset/m0', osim.Vec3(0, 0, 0))
-    mc = cost.marker_cost
-    baseline_m1 = mc.base_stations[0].copy()
-    baseline_m0 = mc.base_stations[1].copy()
+    cost.add_marker_bilevel_cost_term('/markerset/m0', osim.Vec3(0, 0, 0))
+    term = cost.marker_term
+    baseline_m1 = term.base_stations[0].copy()
+    baseline_m0 = term.base_stations[1].copy()
 
     body_scale = np.ones(3)
     offset = np.array([0.1, -0.2, 0.3])
-    mc.apply_state(body_scale, offset)
-    np.testing.assert_allclose(mc.stations.getElt(0).to_numpy(),
+    term.apply_state(body_scale, offset)
+    np.testing.assert_allclose(term.stations.getElt(0).to_numpy(),
                                baseline_m1 + offset)
-    np.testing.assert_allclose(mc.stations.getElt(1).to_numpy(), baseline_m0)
+    np.testing.assert_allclose(term.stations.getElt(1).to_numpy(), baseline_m0)
 
     # apply_state() is idempotent.
-    mc.apply_state(body_scale, offset)
-    np.testing.assert_allclose(mc.stations.getElt(0).to_numpy(),
+    term.apply_state(body_scale, offset)
+    np.testing.assert_allclose(term.stations.getElt(0).to_numpy(),
                                baseline_m1 + offset)
 
 
@@ -558,20 +571,20 @@ def test_bilevel_offset_changes_marker_error():
     """
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[MarkerOffsetGroup(['/markerset/m1'], [2])],
         frame_offset_groups=[])
-    cost.add_marker_bilevel_cost('/markerset/m1', osim.Vec3(0.5, 0, 0),
+    cost.add_marker_bilevel_cost_term('/markerset/m1', osim.Vec3(0.5, 0, 0),
                                  offset_group_index=0)
-    q = ca.DM.zeros(len(cost.mc.q_indexes))
+    q = ca.DM.zeros(len(cost.mc.coordinate_indexes))
     s = ca.DM.ones(3)
     # No offset: m1 world = 0.5, reference = 0.5, error = 0.
-    assert float(cost(q, s, ca.DM.zeros(3), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s, ca.DM.zeros(3), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.0, abs=1e-12)
     # Offset X by 0.2: m1 world = 0.7, error = (0.7 - 0.5)^2 = 0.04.
-    assert float(cost(q, s, ca.DM([0.2, 0, 0]), ca.DM.zeros(0, 1))) == \
+    assert float(cost(CostInput(q, s, ca.DM([0.2, 0, 0]), ca.DM.zeros(0, 1)))) == \
         pytest.approx(0.04, abs=1e-9)
 
 
@@ -582,18 +595,18 @@ def test_bilevel_offset_frame_orientation_invariant():
     """
     model = create_sliding_mass_model()
     model.initSystem()
-    cost = BilevelCostFunction(
+    cost = build_bilevel_cost(
         'cost', ModelCache(model),
         body_scale_groups=[BodyScaleGroup(['/bodyset/body'], [1])],
         marker_offset_groups=[],
         frame_offset_groups=[FrameOffsetGroup(['/bodyset/body'], [1])])
-    cost.add_frame_bilevel_cost(
+    cost.add_frame_bilevel_cost_term(
         '/bodyset/body', osim.Vec3(0), osim.Quaternion(0.9, 0.1, 0.2, 0.3),
         position_weight=0.0, orientation_weight=1.0, offset_group_index=0)
-    q = ca.DM.zeros(len(cost.mc.q_indexes))
+    q = ca.DM.zeros(len(cost.mc.coordinate_indexes))
     s = ca.DM.ones(3)
-    e0 = float(cost(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(3)))
-    e1 = float(cost(q, s, ca.DM.zeros(0, 1), ca.DM([0.2, -0.1, 0.3])))
+    e0 = float(cost(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM.zeros(3))))
+    e1 = float(cost(CostInput(q, s, ca.DM.zeros(0, 1), ca.DM([0.2, -0.1, 0.3]))))
     assert e0 > 0.0
     assert e0 == pytest.approx(e1, abs=1e-12)
 
@@ -614,26 +627,26 @@ def test_bilevel_cost_function_offset_jacobians_full_body():
 
     marker_offset_groups = [MarkerOffsetGroup(['/markerset/R.Shoulder'], [torso_mbx])]
     frame_offset_groups = [FrameOffsetGroup(['/bodyset/pelvis'], [pelvis_mbx])]
-    cost_jac = BilevelCostFunction(
+    cost_jac = build_bilevel_cost(
         'cost_jac', ModelCache(model), body_scale_groups=body_scale_groups,
         marker_offset_groups=marker_offset_groups,
         frame_offset_groups=frame_offset_groups)
-    cost_fd = BilevelCostFunction(
+    cost_fd = build_bilevel_cost(
         'cost_fd', ModelCache(model), body_scale_groups=body_scale_groups,
         marker_offset_groups=marker_offset_groups,
         frame_offset_groups=frame_offset_groups, opts={'enable_fd': True})
 
     for cost in (cost_jac, cost_fd):
-        cost.add_marker_bilevel_cost(
+        cost.add_marker_bilevel_cost_term(
             '/markerset/R.Shoulder', osim.Vec3(0.3, 0, 0), weight=2.0,
             offset_group_index=0)
-        cost.add_frame_bilevel_cost(
+        cost.add_frame_bilevel_cost_term(
             '/bodyset/pelvis', osim.Vec3(0.3, 0.1, -0.2),
             osim.Quaternion(0.9, 0.1, 0.2, 0.3),
             position_weight=2.0, orientation_weight=1.5,
             offset_group_index=0)
 
-    nq = len(cost_jac.mc.q_indexes)
+    nq = len(cost_jac.mc.coordinate_indexes)
     q = ca.SX.sym('q', nq)
     s = ca.SX.sym('s', 3)
     mo = ca.SX.sym('mo', 3)
@@ -641,9 +654,9 @@ def test_bilevel_cost_function_offset_jacobians_full_body():
     x = ca.vertcat(q, s, mo, fo)
 
     J_jac = ca.Function('J_jac', [x],
-                        [ca.jacobian(cost_jac(q, s, mo, fo), x)])
+                        [ca.jacobian(cost_jac(CostInput(q, s, mo, fo)), x)])
     J_fd = ca.Function('J_fd', [x],
-                       [ca.jacobian(cost_fd(q, s, mo, fo), x)])
+                       [ca.jacobian(cost_fd(CostInput(q, s, mo, fo)), x)])
 
     val = np.concatenate([
         np.full(nq, 0.1),

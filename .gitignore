@@ -13,3 +13,6 @@ __pycache__/
 
 # Dependency files
 dependencies/opensim
+
+# VS Code
+.vscode/

@@ -90,12 +90,18 @@ class ModelCache:
         The cached matter subsystem reference.
     num_mobod: int
         Total Simbody mobod count, including Ground at index 0.
-    q_map: dict[str, int]
+    coordinate_map: dict[str, int]
         Mapping from absolute coordinate path to its q-index in the State,
         restricted to independent coordinates (e.g., coupled coordinates are
         excluded).
-    q_indexes: list[int]
+    coordinate_indexes: list[int]
         The q-indexes of the independent coordinates, in registration order.
+    body_scale_groups: list[BodyScaleGroup]
+        The list of BodyScaleGroups associated with this model.
+    marker_offset_groups: list[MarkerOffsetGroup]
+        The list of MarkerOffsetGroups associated with this model.
+    frame_offset_groups: list[FrameOffsetGroup]
+        The list of FrameOffsetGroups associated with this model.
     parent_of: dict[int, int]
         Per-mobod parent in the multibody tree. ``parent_of[k]`` is the
         ``MobilizedBodyIndex`` of body ``k``'s parent (Ground has no entry).
@@ -110,9 +116,12 @@ class ModelCache:
         self.state = self.model.initSystem()
         self.matter = self.model.getMatterSubsystem()
         self.num_mobod = self.model.getNumBodies() + 1
-        self.q_map = self._get_coordinate_index_map(self.model,
+        self.coordinate_map = self._get_coordinate_index_map(self.model,
                                                     skip_dependent_coordinates=True)
-        self.q_indexes = list(self.q_map.values())
+        self.coordinate_indexes = list(self.coordinate_map.values())
+        self.body_scale_groups: list[BodyScaleGroup] = []
+        self.marker_offset_groups: list[MarkerOffsetGroup] = []
+        self.frame_offset_groups: list[FrameOffsetGroup] = []
 
         # For now, disallow models with joints where qdot != u.
         assert(self.state.getNQ() == self.state.getNU())
@@ -149,6 +158,32 @@ class ModelCache:
             self.baseline_p_BM[mbx] = X_BM.p().to_numpy()
             self.baseline_R_BM[mbx] = osim.Rotation(X_BM.R())
 
+    def add_parameter_group(self, group) -> None:
+        """
+        Append a parameter group to the appropriate cached list, dispatched by type.
+        Solvers call this from `add_parameter()` so the group descriptors needed by the
+        cost callbacks live on the ModelCache rather than being rebuilt on each use.
+
+        Parameters
+        ----------
+        group: BodyScaleGroup, MarkerOffsetGroup, or FrameOffsetGroup
+            The parameter group to register.
+
+        Raises
+        ------
+        ValueError
+            If `group` is not a recognized parameter group type.
+        """
+        if isinstance(group, BodyScaleGroup):
+            self.body_scale_groups.append(group)
+        elif isinstance(group, MarkerOffsetGroup):
+            self.marker_offset_groups.append(group)
+        elif isinstance(group, FrameOffsetGroup):
+            self.frame_offset_groups.append(group)
+        else:
+            raise ValueError(
+                f'Unsupported parameter group type {type(group).__name__}.')
+
     @staticmethod
     def _get_coordinate_index_map(model: osim.Model,
                                   skip_dependent_coordinates: bool=True) -> dict:
@@ -164,18 +199,18 @@ class ModelCache:
         """
         state = model.getWorkingState()
         state_paths = osim.createStateVariableNamesInSystemOrder(model)
-        q_map: dict[str, int] = {}
+        coordinate_map: dict[str, int] = {}
         for i, state_path in enumerate(state_paths):
             if 'value' in state_path:
                 coord_path = state_path.replace('/value', '')
                 coordinate = osim.Coordinate.safeDownCast(model.getComponent(coord_path))
                 if skip_dependent_coordinates:
                     if not coordinate.isDependent(state):
-                        q_map[coord_path] = i
+                        coordinate_map[coord_path] = i
                 else:
-                    q_map[coord_path] = i
+                    coordinate_map[coord_path] = i
 
-        return q_map
+        return coordinate_map
 
     def get_joint_for_mobilized_body_index(self, mobod_index: int) -> osim.Joint:
         """
@@ -203,7 +238,6 @@ class ModelCache:
                 f"MobilizedBodyIndex {mobod_index}")
 
     def set_scaled_mobilizer_frame_positions(self, state: osim.State,
-                                             body_scale_groups: list[BodyScaleGroup],
                                              body_scales: np.ndarray) -> None:
         """
         Set the inboard (X_PF) and outboard (X_BM) mobilizer frame positions given body
@@ -219,12 +253,10 @@ class ModelCache:
         ----------
         state: osim.State
             The State to update.
-        body_scale_groups: list[BodyScaleGroup]
-            Body-scale groups, each carrying the inboard/outboard Joints to scale.
         body_scales: np.ndarray, shape (3 * len(body_scale_groups),)
             Flat XYZ body-scale variables, one Vec3 per BodyScaleGroup.
         """
-        for i, group in enumerate(body_scale_groups):
+        for i, group in enumerate(self.body_scale_groups):
             s = np.asarray(body_scales[3*i : 3*i+3], dtype=float)
 
             # Outboard frame (X_BM) attached to each group body.
@@ -317,8 +349,7 @@ class ModelCache:
                                float(tscale_np[2])))
 
     def calc_position_jacobian_wrt_body_scales(self, state: osim.State,
-                dp_GB: osim.VectorVec3,
-                body_scale_groups: list[BodyScaleGroup]) -> np.ndarray:
+                                               dp_GB: osim.VectorVec3) -> np.ndarray:
         """
         Return the position-error Jacobian with respect to body scales given a
         `State` object with scaled inboard and outboard applied and a vector `dp_GB`
@@ -351,8 +382,8 @@ class ModelCache:
             ds_body[px] += self.baseline_p_PF[cx] * dp_PF[cx].to_numpy()
             ds_body[cx] += self.baseline_p_BM[cx] * dp_BM[cx].to_numpy()
 
-        Js = np.zeros((1, 3 * len(body_scale_groups)))
-        for i, group in enumerate(body_scale_groups):
+        Js = np.zeros((1, 3 * len(self.body_scale_groups)))
+        for i, group in enumerate(self.body_scale_groups):
             col = np.zeros(3)
             for k in group.mobod_indexes:
                 col += ds_body[k,:]
@@ -392,9 +423,14 @@ class Parameter(ABC):
     group_type: type
         The math-layer descriptor type (e.g., `BodyScaleGroup`) for this parameter, as
         consumed by the cost callback.
+    cost_input: str
+        The name of the `CostInput` field this parameter's variable block feeds (e.g.,
+        ``'body_scales'``). Solvers use it to order parameter blocks by
+        `CostInput.INPUT_ORDER`.
     """
     value: np.ndarray = None
     group_type: type = None
+    cost_input: str = None
 
     @abstractmethod
     def validate(self, mc: ModelCache) -> None:
@@ -499,6 +535,7 @@ class BodyScale(Vec3Parameter):
         Initial [sx, sy, sz] scale.
     """
     group_type = BodyScaleGroup
+    cost_input = 'body_scales'
 
     def __init__(self, paths: str | list[str], bounds: Bounds, value: np.ndarray):
         super().__init__(paths, bounds, value)
@@ -536,6 +573,8 @@ class MarkerOffset(Vec3Parameter):
         Initial [ox, oy, oz] offset. Defaults to ``None`` (unset).
     """
     group_type = MarkerOffsetGroup
+    cost_input = 'marker_offsets'
+
     def __init__(self, paths: str | list[str], bounds: Bounds, value: np.ndarray):
         super().__init__(paths, bounds, value)
         self.mobod_indexes: list[int] = None
@@ -586,6 +625,8 @@ class FrameOffset(Vec3Parameter):
         Initial [ox, oy, oz] offset. Defaults to ``None`` (unset).
     """
     group_type = FrameOffsetGroup
+    cost_input = 'frame_offsets'
+
     def __init__(self, paths: str | list[str], bounds: Bounds, value: np.ndarray):
         super().__init__(paths, bounds, value)
         self.mobod_indexes: list[int] = None

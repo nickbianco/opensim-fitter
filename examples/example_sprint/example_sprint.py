@@ -6,8 +6,8 @@ import opensim as osim
 from scipy.interpolate import BSpline
 from osimfit.data_sources import MarkerSource
 from osimfit.solvers import (InverseKinematicsSolver,
-                             SplineBasedInverseKinematicsSolver,
-                             SplineTrackingSolution)
+                             SplinedKinematicsSolver,
+                             SplinedKinematicsSolution)
 
 # EXAMPLE SPRINT
 # --------------
@@ -60,12 +60,12 @@ sto.write(ik_solution.states_table, 'sprint_ik_solution.sto')
 knot_intervals = [0.04, 0.08]
 colors = ['blue', 'orange']
 for knot_interval in knot_intervals:
-    solver = SplineBasedInverseKinematicsSolver(model,
-                                                convergence_tolerance=1e-4,
-                                                position_weight=1.0,
-                                                knot_interval=knot_interval)
+    solver = SplinedKinematicsSolver(model,
+                                     convergence_tolerance=1e-4,
+                                     position_weight=1.0,
+                                     knot_interval=knot_interval)
     solver.add_marker_reference_data(marker_source)
-    spline_ik_solution = solver.solve(SplineTrackingSolution(
+    spline_ik_solution = solver.solve(SplinedKinematicsSolution(
         states_table=osim.TimeSeriesTable('sprint_ik_solution.sto')))
     sto = osim.STOFileAdapter()
     sto.write(spline_ik_solution.states_table,
