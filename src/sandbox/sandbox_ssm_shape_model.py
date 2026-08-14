@@ -9,9 +9,12 @@ implausible `s`. `FemurHeadShapeModel` is one real implementation, built
 from a real 536-subject femur+hip PCA: it morphs a femoral-head landmark
 patch and fits a sphere through it.
 
-`ShapeModelCallback`/`ShapePriorCallback` wrap any `ShapeModel` as a CasADi
-`Callback`, the same way `PositionCallback`/`PositionCallback_Jac` in
-sandbox_jacobians.py wrap a generalized coordinate `q`.
+`ShapeModelCallback` wraps any `ShapeModel` as a CasADi `Callback`, the same
+way `PositionCallback`/`PositionCallback_Jac` in sandbox_jacobians.py wrap a
+generalized coordinate `q` -- needed because `apply`/`geometry_jacobian`
+call real NumPy linear algebra CasADi can't see inside of. `prior(s)`
+doesn't need that: it's plain arithmetic, so CasADi differentiates it
+directly when `fit_shape_factor` calls it on a symbolic `s`.
 """
 
 import csv
@@ -162,96 +165,71 @@ class FemurHeadShapeModel(ShapeModel):
         return dp
 
     def prior(self, s):
-        """Mahalanobis prior in SD units: value and gradient."""
-        s = np.asarray(s).reshape(-1)
-        return float(s @ s), 2.0 * s
+        """Mahalanobis prior in SD units: value and gradient. Written with
+        only `.T`/`@`/`*`, so it works unmodified whether s is numeric or a
+        CasADi symbol -- see fit_shape_factor, which calls this directly on
+        the symbolic decision variable instead of wrapping it in a
+        Callback.
+        """
+        return s.T @ s, 2.0 * s
 
 
-def _numeric_jacobian_callback(name, in_rows, out_rows, eval_fn):
-    """Wraps a plain function `s -> J` as a CasADi Callback Jacobian, in the
-    (nominal-in, nominal-out) -> dense-Jacobian shape CasADi's
-    `get_jacobian` expects. Shared by `ShapeModelCallback` and
-    `ShapePriorCallback` below so they don't each need their own
-    near-identical `JacFun` class.
-    """
-
-    class JacFun(ca.Callback):
-        def __init__(self, opts={}):
-            ca.Callback.__init__(self)
-            self.construct(name, opts)
-
-        def get_n_in(self): return 2   # nominal in, nominal out
-        def get_n_out(self): return 1
-
-        def get_sparsity_in(self, i):
-            if i == 0:
-                return ca.Sparsity.dense(in_rows, 1)
-            return ca.Sparsity(out_rows, 1)
-
-        def get_sparsity_out(self, i):
-            return ca.Sparsity.dense(out_rows, in_rows)
-
-        def eval(self, arg):
-            J = eval_fn(np.asarray(arg[0]).flatten())
-            return [np.asarray(J).reshape(out_rows, in_rows)]
-
-    return JacFun()
-
-
-def _analytic_callback(name, in_rows, out_rows, value_fn, jacobian_fn, opts={}):
-    """Wraps a plain (value_fn, jacobian_fn) pair -- both s -> array -- as a
-    CasADi Callback with an exact analytic Jacobian. This is the one place
-    in the file that actually subclasses ca.Callback; ShapeModelCallback and
-    ShapePriorCallback below are plain functions built on top of it, so
-    neither needs its own bespoke Callback subclass.
-    """
-
-    class AnalyticCallback(ca.Callback):
-        def __init__(self):
-            ca.Callback.__init__(self)
-            self.construct(name, opts)
-
-        def get_n_in(self): return 1
-        def get_n_out(self): return 1
-
-        def get_sparsity_in(self, i):
-            return ca.Sparsity.dense(in_rows, 1)
-
-        def get_sparsity_out(self, i):
-            return ca.Sparsity.dense(out_rows, 1)
-
-        def eval(self, arg):
-            s = np.asarray(arg[0]).flatten()
-            return [np.asarray(value_fn(s)).reshape(out_rows, 1)]
-
-        def has_jacobian(self): return True
-
-        def get_jacobian(self, name, inames, onames, opts):
-            self._jac_callback = _numeric_jacobian_callback(
-                name, in_rows, out_rows, jacobian_fn)
-            return self._jac_callback
-
-    return AnalyticCallback()
-
-
-def ShapeModelCallback(name, shape_model, output_size, opts={}):
+class ShapeModelCallback(ca.Callback):
     """CasADi callback s -> shape_model.apply(s), using
     shape_model.geometry_jacobian(s) as the exact Jacobian. Works for any
-    ShapeModel, generic over n_params and output size.
+    ShapeModel, generic over n_params and output size. Needed because
+    apply/geometry_jacobian call real NumPy linear algebra CasADi can't see
+    inside of -- unlike prior(s), which is plain arithmetic and gets called
+    directly on the symbolic s with no Callback at all.
     """
-    return _analytic_callback(name, shape_model.n_params, output_size,
-                               shape_model.apply,
-                               shape_model.geometry_jacobian, opts)
 
+    def __init__(self, name, shape_model, output_size, opts={}):
+        self.shape_model = shape_model
+        self.output_size = output_size
+        ca.Callback.__init__(self)
+        self.construct(name, opts)
 
-def ShapePriorCallback(name, shape_model, opts={}):
-    """CasADi callback s -> shape_model.prior(s)[0], using
-    shape_model.prior(s)[1] as the exact gradient. Same pattern as
-    ShapeModelCallback, for the regularizer instead of the geometry.
-    """
-    return _analytic_callback(name, shape_model.n_params, 1,
-                               lambda s: shape_model.prior(s)[0],
-                               lambda s: shape_model.prior(s)[1], opts)
+    def get_n_in(self): return 1
+    def get_n_out(self): return 1
+
+    def get_sparsity_in(self, i):
+        return ca.Sparsity.dense(self.shape_model.n_params, 1)
+
+    def get_sparsity_out(self, i):
+        return ca.Sparsity.dense(self.output_size, 1)
+
+    def eval(self, arg):
+        s = np.asarray(arg[0]).flatten()
+        return [np.asarray(self.shape_model.apply(s)).reshape(-1, 1)]
+
+    def has_jacobian(self): return True
+
+    def get_jacobian(self, name, inames, onames, opts):
+        shape_model = self.shape_model
+        output_size = self.output_size
+
+        class JacFun(ca.Callback):
+            def __init__(self, opts={}):
+                ca.Callback.__init__(self)
+                self.construct(name, opts)
+
+            def get_n_in(self): return 2   # nominal in, nominal out
+            def get_n_out(self): return 1
+
+            def get_sparsity_in(self, i):
+                if i == 0:
+                    return ca.Sparsity.dense(shape_model.n_params, 1)
+                return ca.Sparsity(output_size, 1)
+
+            def get_sparsity_out(self, i):
+                return ca.Sparsity.dense(output_size, shape_model.n_params)
+
+            def eval(self, arg):
+                J = shape_model.geometry_jacobian(np.asarray(arg[0]).flatten())
+                return [np.asarray(J).reshape(output_size, shape_model.n_params)]
+
+        self._jac_callback = JacFun()
+        return self._jac_callback
 
 
 def check_jacobian_fd(shape_model, s0=0.3, eps=1e-4):
@@ -272,10 +250,10 @@ def fit_shape_factor(shape_model, target, prior_weight=1e-3):
     a known s* (see __main__ below for the exact check)."""
     s = ca.MX.sym("s", shape_model.n_params)
     head = ShapeModelCallback("head", shape_model, output_size=3)
-    prior = ShapePriorCallback("prior", shape_model)
-    cost = ca.sumsqr(head(s) - target) + prior_weight * prior(s)
-    # limited-memory: the callbacks only supply Jacobians, not Hessians
-    # (same reason osimfit's own solvers.py sets this).
+    prior_value, _ = shape_model.prior(s)
+    cost = ca.sumsqr(head(s) - target) + prior_weight * prior_value
+    # limited-memory: the geometry callback only supplies a Jacobian, not a
+    # Hessian (same reason osimfit's own solvers.py sets this).
     solver = ca.nlpsol("solver", "ipopt", {"x": s, "f": cost},
                         {"print_time": False, "ipopt.print_level": 0,
                          "ipopt.hessian_approximation": "limited-memory"})
