@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .bounds import Bounds
 from .data_sources import DataSource, MarkerSource, TheiaFrameSource
+from .costs import Cost, CostInput
 from .callbacks import TrackingCostFunction, BilevelCostFunction
 from .model import ModelCache, Parameter, BodyScale, MarkerOffset, FrameOffset
 from .scaling import Axis, Scaler, ManualBodyScale
@@ -37,14 +38,6 @@ class Solution:
     """
     Base class for solver solutions.
     """
-
-@dataclass
-class TrackingSolution(Solution):
-    """
-    Solution for tracking solvers. Contains the optimized model states as an OpenSim
-    TimeSeriesTable and a static helper for constructing it from raw trajectory arrays.
-    """
-    states_table: osim.TimeSeriesTable
 
     @staticmethod
     def create_states_table(model, state, coordinate_indexes, times,
@@ -78,31 +71,40 @@ class TrackingSolution(Solution):
 
 
 @dataclass
-class SplineTrackingSolution(TrackingSolution):
+class InverseKinematicsSolution(Solution):
     """
-    TrackingSolution for spline-based solvers. Adds the optimal B-spline control
-    points (nodes) for each coordinate.
+    Solution for the `InverseKinematicsSolver`. Contains the optimized model states as
+    an OpenSim TimeSeriesTable.
 
     Attributes
     ----------
-    spline_nodes: np.ndarray, shape (num_knots, num_coords)
+    states_table: osim.TimeSeriesTable
+        The table of optimized model states.
     """
-    spline_nodes: np.ndarray = None
+    states_table: osim.TimeSeriesTable
 
 
 @dataclass
-class BilevelSolution(TrackingSolution):
+class SplinedKinematicsSolution(Solution):
     """
-    Solution for bilevel solvers. Separates the optimized coordinate trajectories from
-    the optimized parameters (e.g., body scales, marker and frame offsets).
+    Solution for the `SplinedKinematicsSolver`. Contains the optimized model states, the
+    optimal B-spline control points (nodes) for each coordinate, and, when the solver
+    was configured with bilevel parameters, the optimized parameters.
 
     Attributes
     ----------
-    parameters: list[Parameter]
-        The optimized parameters, each carrying its optimal ``value``. This is an
-        independent snapshot of the solver's parameter configuration. The same list
-        (with values set) can be handed back to ``solve()`` as an initial guess.
+    states_table: osim.TimeSeriesTable
+        The table of optimized model states.
+    spline_nodes: np.ndarray, shape (num_knots, num_coords), optional
+        The optimal B-spline control points for each coordinate.
+    parameters: list[Parameter], optional
+        The optimized parameters (e.g., body scales, marker and frame offsets), each
+        carrying its optimal ``value``, or None if the solver optimized kinematics only.
+        This is an independent snapshot of the solver's parameter configuration; the same
+        list (with values set) can be handed back to ``solve()`` as an initial guess.
     """
+    states_table: osim.TimeSeriesTable
+    spline_nodes: np.ndarray = None
     parameters: list[Parameter] = None
 
     def get_parameter(self, path: str, cls: type = Parameter) -> Parameter:
@@ -133,19 +135,6 @@ class BilevelSolution(TrackingSolution):
 
 
 @dataclass
-class SplineBilevelSolution(BilevelSolution):
-    """
-    BilevelSolution for spline-based bilevel solvers. Adds the optimal B-spline
-    control points (nodes) for each coordinate.
-
-    Attributes
-    ----------
-    spline_nodes: np.ndarray, shape (num_knots, num_coords)
-    """
-    spline_nodes: np.ndarray = None
-
-
-@dataclass
 class MarkerPlacerSolution(Solution):
     """
     Solution for the `MarkerPlacer` solver.
@@ -154,7 +143,7 @@ class MarkerPlacerSolution(Solution):
     ----------
     pose: np.ndarray, shape (num_independent_coords,)
         Optimized independent-coordinate values for the placement pose, in the order of
-        the solver's ``q_indexes``.
+        the solver's ``coordinate_indexes``.
     marker_offsets: list[MarkerOffset]
         The optimized marker placement offsets, each carrying its optimal ``value`` (an
         XYZ translation expressed in the marker's base frame).
@@ -187,6 +176,10 @@ class Solver(ABC):
     # an initial guess (and return from solve()).
     _guess_type: type = Solution
 
+    # Concrete subclasses override to define the set of CostInput fields supported by
+    # the solver.
+    SUPPORTED_INPUTS: frozenset[str] = frozenset()
+
     def __init__(self, model: str | osim.Model, convergence_tolerance: float=1e-4):
         super().__init__()
 
@@ -197,11 +190,33 @@ class Solver(ABC):
         self.state = self.mc.state
 
         # Convenience aliases for the cached coordinate maps.
-        self.q_map = self.mc.q_map
-        self.q_indexes = self.mc.q_indexes
+        self.coordinate_map = self.mc.coordinate_map
+        self.coordinate_indexes = self.mc.coordinate_indexes
 
         # Optimization settings.
         self.convergence_tolerance = convergence_tolerance
+
+        # Additional user-registered costs (e.g., regularization) appended via
+        # add_cost()
+        self.costs: list[Cost] = []
+
+    def add_cost(self, cost: Cost):
+        """
+        Register an additional `Cost` to include in the solver's objective. The cost is
+        evaluated by calling it with a `CostInput`.
+
+        Raises
+        ------
+        ValueError
+            If the cost depends on a `CostInput` field this solver does not provide.
+        """
+        unsupported = cost.required_inputs - self.SUPPORTED_INPUTS
+        if unsupported:
+            raise ValueError(
+                f'{type(self).__name__} does not support {type(cost).__name__}: it '
+                f'requires cost input(s) {sorted(unsupported)} that this solver does '
+                f'not provide (supported: {sorted(self.SUPPORTED_INPUTS)}).')
+        self.costs.append(cost)
 
     def get_ipopt_options(self, print_level=0):
         """
@@ -237,7 +252,7 @@ class Solver(ABC):
                 f'({table.getNumRows()} rows, {table.getNumColumns()} columns).')
 
         labels = set(table.getColumnLabels())
-        missing = [coord_path + '/value' for coord_path in self.q_map
+        missing = [coord_path + '/value' for coord_path in self.coordinate_map
                    if coord_path + '/value' not in labels]
         if missing:
             raise ValueError(
@@ -355,7 +370,7 @@ class TrackingSolver(Solver):
 
         for data in self.theia_frame_data:
             for iframe, frame_path in enumerate(data.labels):
-                callback.add_frame_tracking_cost(
+                callback.add_frame_tracking_cost_term(
                     frame_path,
                     data.positions.getRowAtIndex(itime).getElt(0, iframe),
                     data.orientations.getRowAtIndex(itime).getElt(0, iframe),
@@ -364,7 +379,7 @@ class TrackingSolver(Solver):
 
         for data in self.marker_data:
             for iframe, marker_path in enumerate(data.labels):
-                callback.add_marker_tracking_cost(
+                callback.add_marker_tracking_cost_term(
                     marker_path,
                     data.positions.getRowAtIndex(itime).getElt(0, iframe),
                     weight=position_weight)
@@ -404,7 +419,8 @@ class InverseKinematicsSolver(TrackingSolver):
         See `TrackingSolver`.
     """
 
-    _guess_type = TrackingSolution
+    _guess_type = InverseKinematicsSolution
+    SUPPORTED_INPUTS = frozenset({'coordinates'})
 
     def __init__(self, model, convergence_tolerance=1e-4, position_weight=1.0,
                  orientation_weight=1.0):
@@ -416,18 +432,22 @@ class InverseKinematicsSolver(TrackingSolver):
         A helper function to create a CasADi solver for the tracking problem at a
         given time step.
         """
-        x = ca.SX.sym('x', len(self.q_indexes))
+        x = ca.SX.sym('x', len(self.coordinate_indexes))
         callback = self.create_tracking_callback('tracking_cost', itime,
                                                  position_weight=position_weight,
                                                  orientation_weight=orientation_weight)
-        f = callback(x)
+        cost_input = CostInput(coordinates=x)
+        f = callback(cost_input)
+        for cost in self.costs:
+            f += cost(cost_input)
         nlp = {'x': x, 'f': f}
         opts = {}
         opts['ipopt'] = self.get_ipopt_options()
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
         return callback, solver
 
-    def solve(self, guess: TrackingSolution = None) -> TrackingSolution:
+    def solve(self, guess: InverseKinematicsSolution = None
+              ) -> InverseKinematicsSolution:
 
         times = self.get_times_from_reference_data()
         num_times = len(times)
@@ -441,7 +461,7 @@ class InverseKinematicsSolver(TrackingSolver):
         x0 = []
         lbx = []
         ubx = []
-        for coord_path in self.q_map:
+        for coord_path in self.coordinate_map:
             coord = osim.Coordinate.safeDownCast(self.mc.model.getComponent(coord_path))
             x0.append(coord.getDefaultValue())
             lbx.append(coord.getRangeMin())
@@ -455,12 +475,12 @@ class InverseKinematicsSolver(TrackingSolver):
             guess_q = np.column_stack([
                 guess.states_table.getDependentColumn(
                     coord_path + '/value').to_numpy()
-                for coord_path in self.q_map])
+                for coord_path in self.coordinate_map])
 
         # Iterate over all of the time steps in the tracking data and solve the
         # optimization problem at each time step.
         statesTraj = osim.StatesTrajectory()
-        q_traj = np.zeros((num_times, len(self.q_indexes)))
+        q_traj = np.zeros((num_times, len(self.coordinate_indexes)))
         for itime, time in enumerate(times):
             print(f'Solving time {itime+1} of {num_times} (t={time:.3f} s)...')
 
@@ -479,33 +499,55 @@ class InverseKinematicsSolver(TrackingSolver):
             # StatesTrajectory.append() copies the state by value, so reuse is safe.
             callback.state.setTime(time)
             q = np.zeros(callback.state.getNQ())
-            q[self.q_indexes] = q_traj[itime, :]
+            q[self.coordinate_indexes] = q_traj[itime, :]
             callback.state.setQ(osim.Vector.createFromMat(q))
             statesTraj.append(callback.state)
 
             if guess_q is None:
                 x0 = sol['x']
 
-        return TrackingSolution(
+        return InverseKinematicsSolution(
             states_table=statesTraj.exportToTable(self.mc.model),
         )
 
 
-class SplineBasedSolverMixin:
+#############################
+# SPLINED KINEMATICS SOLVER #
+#############################
+
+class SplinedKinematicsSolver(TrackingSolver):
     """
-    A mixin class that provides common functionality for spline-based solvers, which
-    represent the predicted trajectories as B-splines and optimize over the spline
-    control points.
+    Solve for model kinematics by representing each coordinate trajectory as a B-spline
+    and optimizing over the spline control points across the whole trial. Because the
+    control points couple every time step, this solver can optionally also optimize
+    global bilevel parameters (e.g., body scales, marker and frame offsets); register
+    them with ``add_parameter``. With no parameters registered, it reduces to a
+    spline-based inverse kinematics problem tracking the reference data.
 
     Parameters
     ----------
+    model: str or osim.Model
+        See `Solver`.
+    convergence_tolerance: float, optional
+        See `Solver`.
+    position_weight: float, optional
+        See `TrackingSolver`.
+    orientation_weight: float, optional
+        See `TrackingSolver`.
     degree: int, optional
         The degree of the B-spline basis functions. Default is 3 (i.e., cubic splines).
     knot_interval: float, optional
         The interval between knots in the B-spline basis. Default is 0.05 seconds.
     """
-    def __init__(self, *args, degree=3, knot_interval=0.05, **kwargs):
-        super().__init__(*args, **kwargs)
+    _guess_type = SplinedKinematicsSolution
+    SUPPORTED_INPUTS = frozenset({'body_scales', 'marker_offsets', 'frame_offsets'})
+
+    def __init__(self, model, convergence_tolerance=1e-4, position_weight=1.0,
+                 orientation_weight=1.0, degree=3, knot_interval=0.05):
+        super().__init__(model, convergence_tolerance=convergence_tolerance,
+                         position_weight=position_weight,
+                         orientation_weight=orientation_weight)
+        self._parameters_by_input: dict[str, list[Parameter]] = {}
         self.degree = degree
         self.knot_interval = knot_interval
 
@@ -562,241 +604,86 @@ class SplineBasedSolverMixin:
         q_guess, _, _, _ = np.linalg.lstsq(np.array(B), q_col, rcond=None)
         return q_guess.tolist()
 
-
-class SplineBasedInverseKinematicsSolver(SplineBasedSolverMixin, TrackingSolver):
-    """
-    An inverse kinematics solver that optimizes model coordinate values to minimize
-    tracking error, where the predicted trajectories are represented as B-splines and
-    the optimization variables are the spline control points.
-
-    Parameters
-    ----------
-    model: str or osim.Model
-        See `Solver`.
-    convergence_tolerance: float, optional
-        See `Solver`.
-    position_weight: float, optional
-        See `TrackingSolver`.
-    orientation_weight: float, optional
-        See `TrackingSolver`.
-    degree: int, optional
-        See `SplineBasedSolverMixin`.
-    knot_interval: float, optional
-        See `SplineBasedSolverMixin`.
-    """
-
-    _guess_type = SplineTrackingSolution
-
-    def __init__(self, model, convergence_tolerance=1e-4, position_weight=1.0,
-                 orientation_weight=1.0, degree=3, knot_interval=0.05):
-        super().__init__(model, convergence_tolerance=convergence_tolerance,
-                         position_weight=position_weight,
-                         orientation_weight=orientation_weight,
-                         degree=degree, knot_interval=knot_interval)
-
-    def solve(self, guess: SplineTrackingSolution = None) -> SplineTrackingSolution:
-
-        times = self.get_times_from_reference_data()
-        num_times = len(times)
-
-        if guess is not None:
-            self._validate_guess(guess)
-
-        # Define the knot vector.
-        num_knots = int((times[-1] - times[0]) / self.knot_interval)
-        knots = self.build_knots_vector(times, num_knots)
-
-        # Pre-compute the spline basis matrix, which is independent of the optimization
-        # variables.
-        B, dB = self.build_spline_basis_matrix(times, knots)
-
-        # Define the optimization variables, which are the spline control points for
-        # each coordinate.
-        coeffs = ca.MX.sym('coeffs', num_knots, len(self.q_indexes))
-        x0 = []
-        lbx = []
-        ubx = []
-        for coord_path in self.q_map:
-            coord = osim.Coordinate.safeDownCast(self.mc.model.getComponent(coord_path))
-            x0 += ([coord.getDefaultValue()] * num_knots if guess is None
-                   else self.extract_coordinate_initial_guess(
-                       guess.states_table, B, coord_path))
-            lbx += [coord.getRangeMin()] * num_knots
-            ubx += [coord.getRangeMax()] * num_knots
-
-        # Map the control points to the full predicted trajectory via the spline basis
-        # matrix.
-        q = B @ coeffs
-
-        # Compute the tracking cost at each time step via a callback.
-        errors = ca.MX(num_times, 1)
-        callbacks = []
-        for itime in range(num_times):
-            callbacks.append(self.create_tracking_callback(
-                f'tracking_cost_time_{itime}', itime,
-                position_weight=self.position_weight,
-                orientation_weight=self.orientation_weight))
-            errors[itime] = callbacks[itime](q[itime, :].T)
-
-        # Compute total cost.
-        f = self.compute_average_trapezoidal_error(errors, times)
-
-        # Solve.
-        nlp = {'x': ca.vec(coeffs), 'f': f}
-        opts = {}
-        opts['ipopt'] = self.get_ipopt_options(print_level=5)
-        solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-        sol = solver(x0=x0, lbx=lbx, ubx=ubx)
-
-        # Reconstruct the optimal trajectory by evaluating the spline at the
-        # input data time points.
-        coeffs_opt = ca.reshape(sol['x'], num_knots, len(self.q_indexes))
-        q_opt = np.array(B @ coeffs_opt)    # (num_times, num_coords)
-        qdot_opt = np.array(dB @ coeffs_opt)
-
-        return SplineTrackingSolution(
-            states_table=TrackingSolution.create_states_table(
-                self.mc.model, self.state, self.q_indexes, times, q_opt, qdot_opt),
-            spline_nodes=np.array(coeffs_opt),
-        )
-
-###################
-# BILEVEL SOLVERS #
-###################
-
-class BilevelSolver(TrackingSolver):
-    """
-    An abstract base class for solvers that solve bilevel optimization problems,
-    i.e., problems that optimize over both the kinematics and body scales to
-    minimize tracking error. Concrete subclasses must implement the solve() method,
-    which should return a Solution object.
-
-    Parameters
-    ----------
-    model: str or osim.Model
-        See `Solver`.
-    convergence_tolerance: float, optional
-        See `Solver`.
-    position_weight: float, optional
-        See `TrackingSolver`.
-    orientation_weight: float, optional
-        See `TrackingSolver`.
-    body_scale_regularization_weight: float, optional
-        The weight to apply to the regularization term on the body scales in the
-        bilevel optimization problem. Default is 0.0 (i.e., no regularization).
-    offset_regularization_weight: float, optional
-        The weight to apply to the regularization term on the marker/frame XYZ
-        offsets in the bilevel optimization problem, penalizing offsets away from
-        zero. Default is 0.0 (i.e., no regularization).
-    """
-    PARAMETER_ORDER = (BodyScale, MarkerOffset, FrameOffset)
-    def __init__(self, model, convergence_tolerance=1e-4, position_weight=1.0,
-                 orientation_weight=1.0, body_scale_regularization_weight=0.0,
-                 offset_regularization_weight=0.0):
-        super().__init__(model, convergence_tolerance, position_weight,
-                         orientation_weight)
-        if body_scale_regularization_weight < 0:
-            raise ValueError(
-                f'Expected body_scale_regularization_weight to be non-negative, but '
-                f'got {body_scale_regularization_weight}.')
-        if offset_regularization_weight < 0:
-            raise ValueError(
-                f'Expected offset_regularization_weight to be non-negative, but '
-                f'got {offset_regularization_weight}.')
-        self.body_scale_regularization_weight = body_scale_regularization_weight
-        self.offset_regularization_weight = offset_regularization_weight
-        self.parameters: list[Parameter] = []
-
-    @staticmethod
-    def compute_scale_regularization(s, weight, target=1.0):
+    @property
+    def parameters(self) -> list[Parameter]:
         """
-        Quadratic regularization penalty on a vector of scale factors:
-
-            cost = weight * sum_i (s_i - target)^2
-
-        Encourages each scale factor to stay near ``target`` (typically 1.0,
-        i.e., identity scaling) so that the optimizer only deviates from the
-        nominal scaling when doing so produces a substantial improvement in
-        the primary tracking cost.
-
-        Parameters
-        ----------
-        s: ca.MX or ca.SX
-            Symbolic vector of scales.
-        weight: float
-            Non-negative scalar applied to the sum-of-squares.
-        target: float, optional
-            Per-component target value. Default is 1.0.
-
-        Returns
-        -------
-        ca.MX or ca.SX
-            Scalar regularization cost expression.
+        All registered parameters, flattened in `CostInput.INPUT_ORDER` (the order in
+        which their variable blocks are concatenated into the optimization vector).
+        Within an input, registration order is preserved.
         """
-        return weight * ca.sum((s - target)**2)
+        return [p for name in CostInput.INPUT_ORDER
+                for p in self._parameters_by_input.get(name, [])]
 
     @property
     def body_scales(self) -> list[BodyScale]:
         """
         The registered `BodyScale` parameters, in registration order.
         """
-        return [p for p in self.parameters if isinstance(p, BodyScale)]
+        return list(self._parameters_by_input.get(BodyScale.cost_input, []))
 
     @property
     def marker_offsets(self) -> list[MarkerOffset]:
         """
         The registered `MarkerOffset` parameters, in registration order.
         """
-        return [p for p in self.parameters if isinstance(p, MarkerOffset)]
+        return list(self._parameters_by_input.get(MarkerOffset.cost_input, []))
 
     @property
     def frame_offsets(self) -> list[FrameOffset]:
         """
         The registered `FrameOffset` parameters, in registration order.
         """
-        return [p for p in self.parameters if isinstance(p, FrameOffset)]
+        return list(self._parameters_by_input.get(FrameOffset.cost_input, []))
 
     def add_parameter(self, parameter: Parameter):
         """
         Register a `Parameter` to be optimized over in the bilevel optimization problem.
-        The parameter is validated against the model at registration time.
+        The parameter is validated against the model at registration time, stored under
+        its `CostInput` field, and its group descriptor is appended to the `ModelCache`
+        for the cost callback to consume. Parameter variable blocks are ordered by
+        `CostInput.INPUT_ORDER`.
 
         Parameters
         ----------
         parameter: Parameter
-            The parameter to optimize (e.g., a `BodyScale`, `MarkerOffset`, or
-            `FrameOffset`).
+            The parameter to optimize (e.g., a `BodyScale`).
+
+        Raises
+        ------
+        ValueError
+            If `parameter` is not a `Parameter`, or its `cost_input` is not a recognized
+            `CostInput` field.
         """
+        if not isinstance(parameter, Parameter):
+            raise ValueError(
+                f'add_parameter expected a Parameter, but got '
+                f'{type(parameter).__name__}.')
+        if parameter.cost_input not in CostInput.INPUT_ORDER:
+            raise ValueError(
+                f'{type(parameter).__name__} declares cost_input '
+                f'{parameter.cost_input!r}, which is not a recognized CostInput field '
+                f'{CostInput.INPUT_ORDER}.')
         parameter.validate(self.mc)
-        self.parameters.append(parameter)
+        self._parameters_by_input.setdefault(parameter.cost_input, []).append(parameter)
+        self.mc.add_parameter_group(parameter.to_group())
 
     def create_bilevel_callback(self, name: str, itime: int,
                                 position_weight: float,
                                 orientation_weight: float) -> BilevelCostFunction:
 
-        # Enforce parameter ordering and create parameter groups.
-        ordered = self._order_parameters(self.parameters)
-        body_scale_groups = [p.to_group() for p in ordered
-                             if isinstance(p, BodyScale)]
-        marker_offset_groups = [p.to_group() for p in ordered
-                                if isinstance(p, MarkerOffset)]
-        frame_offset_groups = [p.to_group() for p in ordered
-                               if isinstance(p, FrameOffset)]
-
         # Construct the bilevel callback function.
-        callback = BilevelCostFunction(name, self.mc, body_scale_groups,
-                                       marker_offset_groups, frame_offset_groups)
+        callback = BilevelCostFunction(name, self.mc)
 
         # Map each offset target path to the index of its offset group.
-        marker_index_of = {path: i for i, grp in enumerate(marker_offset_groups)
-                           for path in grp.component_paths}
-        frame_index_of = {path: i for i, grp in enumerate(frame_offset_groups)
-                          for path in grp.component_paths}
+        marker_index_of = {path: i for i, grp in enumerate(self.mc.marker_offset_groups)
+                                   for path in grp.component_paths}
+        frame_index_of = {path: i for i, grp in enumerate(self.mc.frame_offset_groups)
+                                  for path in grp.component_paths}
 
         # Add the tracking cost terms for each frame.
         for data in self.theia_frame_data:
             for iframe, frame_path in enumerate(data.labels):
-                callback.add_frame_bilevel_cost(
+                callback.add_frame_bilevel_cost_term(
                     frame_path,
                     data.positions.getRowAtIndex(itime).getElt(0, iframe),
                     data.orientations.getRowAtIndex(itime).getElt(0, iframe),
@@ -807,7 +694,7 @@ class BilevelSolver(TrackingSolver):
         # Add the tracking cost terms for each marker.
         for data in self.marker_data:
             for iframe, marker_path in enumerate(data.labels):
-                callback.add_marker_bilevel_cost(marker_path,
+                callback.add_marker_bilevel_cost_term(marker_path,
                     data.positions.getRowAtIndex(itime).getElt(0, iframe),
                     weight=position_weight,
                     offset_group_index=marker_index_of.get(marker_path))
@@ -821,14 +708,15 @@ class BilevelSolver(TrackingSolver):
                         f'{label.capitalize()} offset group {group.component_paths} is '
                         f'not tracked by any registered {label}; its offset would be '
                         f'unconstrained.')
-        assert_offset_groups_used(callback.marker_cost.offset_group_indexes,
-                                  marker_offset_groups, 'marker')
-        assert_offset_groups_used(callback.frame_cost.offset_group_indexes,
-                                  frame_offset_groups, 'frame')
+        assert_offset_groups_used(callback.marker_term.offset_group_indexes,
+                                  self.mc.marker_offset_groups, 'marker')
+        assert_offset_groups_used(callback.frame_term.offset_group_indexes,
+                                  self.mc.frame_offset_groups, 'frame')
 
         return callback
 
-    def update_model(self, model: osim.Model, solution: BilevelSolution) -> osim.Model:
+    def update_model(self, model: osim.Model,
+                     solution: SplinedKinematicsSolution) -> osim.Model:
         """
         Apply the solution's optimized parameters to `model` and return it.
         """
@@ -867,32 +755,34 @@ class BilevelSolver(TrackingSolver):
         model.initSystem()
         return model
 
-    def _order_parameters(self, parameters: list[Parameter]) -> list[Parameter]:
-        """
-        Return `parameters` reordered so that parameters of the same type are contiguous
-        and types appear in `PARAMETER_ORDER`. Within a type, registration order is
-        preserved. This is the order in which parameter variable blocks are concatenated
-        into the optimization vector. Raise a ValueError if any parameter's type is not
-        listed in `PARAMETER_ORDER`, so a new type is never silently dropped.
-        """
-        ordered = [p for cls in self.PARAMETER_ORDER
-                    for p in parameters if type(p) is cls]
-        if len(ordered) != len(parameters):
-            unknown = sorted({type(p).__name__ for p in parameters
-                            if type(p) not in self.PARAMETER_ORDER})
-            raise ValueError(
-                f'order_parameters received parameter type(s) not listed in '
-                f'{self.PARAMETER_ORDER}: {unknown}.')
-        return ordered
-
     def _validate_guess(self, guess: Solution):
         super()._validate_guess(guess)
-        expected = self._order_parameters(self.parameters)
-        got = self._order_parameters(guess.parameters or [])
+        if not self.parameters:
+            return
+
+        # Check that the solver parameters and guess parameters are the same size.
+        expected = self.parameters
+        got = guess.parameters or []
         if len(got) != len(expected):
             raise ValueError(
                 f'Initial guess has {len(got)} parameter(s) but the solver is '
                 f'configured with {len(expected)}.')
+
+        # Enforce that the guess lists its parameters grouped in CostInput.INPUT_ORDER.
+        order = CostInput.INPUT_ORDER
+        positions = []
+        for g in got:
+            if g.cost_input not in order:
+                raise ValueError(
+                    f'Initial guess parameter {type(g).__name__} has cost_input '
+                    f'{g.cost_input!r}, which is not a recognized CostInput field '
+                    f'{order}.')
+            positions.append(order.index(g.cost_input))
+        if positions != sorted(positions):
+            raise ValueError(
+                f'Initial guess parameters must be ordered by CostInput.INPUT_ORDER '
+                f'{order}, but got {[g.cost_input for g in got]}.')
+
         for e, g in zip(expected, got):
             if type(g) is not type(e) or g.paths != e.paths:
                 raise ValueError(
@@ -906,47 +796,8 @@ class BilevelSolver(TrackingSolver):
                     f'have shape ({e.num_variables},), got {shape}.')
 
 
-class SplineBasedBilevelSolver(SplineBasedSolverMixin, BilevelSolver):
-    """
-    A solver for bilevel optimization problems that optimize over both the kinematics
-    and body scales to minimize tracking error, where the predicted trajectories
-    are represented as B-splines and the optimization variables are the spline control
-    points and body scales.
-
-    Parameters
-    ----------
-    model: str or osim.Model
-        See `Solver`.
-    convergence_tolerance: float, optional
-        See `Solver`.
-    position_weight: float, optional
-        See `TrackingSolver`.
-    orientation_weight: float, optional
-        See `TrackingSolver`.
-    body_scale_regularization_weight: float, optional
-        See `BilevelSolver`.
-    offset_regularization_weight: float, optional
-        See `BilevelSolver`.
-    degree: int, optional
-        See `SplineBasedSolverMixin`.
-    knot_interval: float, optional
-        See `SplineBasedSolverMixin`.
-    """
-    _guess_type = SplineBilevelSolution
-
-    def __init__(self, model, convergence_tolerance=1e-4, position_weight=1.0,
-                 orientation_weight=1.0, body_scale_regularization_weight=0.0,
-                 offset_regularization_weight=0.0,
-                 degree=3, knot_interval=0.05):
-        super().__init__(model, convergence_tolerance=convergence_tolerance,
-                         position_weight=position_weight,
-                         orientation_weight=orientation_weight,
-                         body_scale_regularization_weight=(
-                             body_scale_regularization_weight),
-                         offset_regularization_weight=offset_regularization_weight,
-                         degree=degree, knot_interval=knot_interval)
-
-    def solve(self, guess: SplineBilevelSolution = None) -> SplineBilevelSolution:
+    def solve(self, guess: SplinedKinematicsSolution = None
+              ) -> SplinedKinematicsSolution:
 
         times = self.get_times_from_reference_data()
         num_times = len(times)
@@ -961,31 +812,30 @@ class SplineBasedBilevelSolver(SplineBasedSolverMixin, BilevelSolver):
         # Pre-compute the spline basis matrix and its derivative.
         B, dB = self.build_spline_basis_matrix(times, knots)
 
-        # Order the registered parameters by type.
-        ordered = self._order_parameters(self.parameters)
-        num_scales = sum(p.num_variables for p in ordered
+        # Extract parameter dimensions.
+        num_params = len(self.parameters)
+        num_scales = sum(p.num_variables for p in self.parameters
                          if isinstance(p, BodyScale))
-        num_markers = sum(p.num_variables for p in ordered
+        num_markers = sum(p.num_variables for p in self.parameters
                           if isinstance(p, MarkerOffset))
-        num_frames = sum(p.num_variables for p in ordered
+        num_frames = sum(p.num_variables for p in self.parameters
                          if isinstance(p, FrameOffset))
 
         # Apply the parameters from the initial guess to the solver's list of registered
         # parameters.
-        if guess is not None:
-            for sp, gp in zip(ordered, self._order_parameters(guess.parameters)):
+        if num_params > 0 and guess is not None and guess.parameters is not None:
+            for sp, gp in zip(self.parameters, guess.parameters):
                 sp.value = np.asarray(gp.value, dtype=float)
 
-        # Define the optimization variables: spline control points, body scale factors,
-        # marker offsets, and frame offsets.
-        coeffs = ca.MX.sym('coeffs', num_knots, len(self.q_indexes))
+        # Define the optimization variables.
+        coeffs = ca.MX.sym('coeffs', num_knots, len(self.coordinate_indexes))
         s = ca.MX.sym('body_scales', num_scales)
         mo = ca.MX.sym('marker_offsets', num_markers)
         fo = ca.MX.sym('frame_offsets', num_frames)
         x0 = []
         lbx = []
         ubx = []
-        for coord_path in self.q_map:
+        for coord_path in self.coordinate_map:
             coord = osim.Coordinate.safeDownCast(self.mc.model.getComponent(coord_path))
             x0 += ([coord.getDefaultValue()] * num_knots if guess is None
                    else self.extract_coordinate_initial_guess(
@@ -995,7 +845,7 @@ class SplineBasedBilevelSolver(SplineBasedSolverMixin, BilevelSolver):
 
         # Append each parameter's initial guess and bounds, in type order, matching the
         # [coeffs, s, mo, fo] layout of the optimization vector below.
-        for p in ordered:
+        for p in self.parameters:
             p.append_guess_and_bounds(x0, lbx, ubx)
 
         # Map the control points to the full predicted trajectory via the spline basis
@@ -1003,22 +853,29 @@ class SplineBasedBilevelSolver(SplineBasedSolverMixin, BilevelSolver):
         q = B @ coeffs
 
         # Compute the tracking cost at each time step via a callback.
-        tracking_errors = ca.MX(num_times, 1)
+        errors = ca.MX(num_times, 1)
         callbacks = []
         for itime in range(num_times):
-            callbacks.append(self.create_bilevel_callback(
-                f'scaled_tracking_cost_time_{itime}', itime,
-                position_weight=self.position_weight,
-                orientation_weight=self.orientation_weight))
-            tracking_errors[itime] = callbacks[itime](q[itime, :].T, s, mo, fo)
+            if num_params > 0:
+                callback = self.create_bilevel_callback(
+                    f'tracking_cost_time_{itime}', itime,
+                    position_weight=self.position_weight,
+                    orientation_weight=self.orientation_weight)
+            else:
+                callback = self.create_tracking_callback(
+                    f'tracking_cost_time_{itime}', itime,
+                    position_weight=self.position_weight,
+                    orientation_weight=self.orientation_weight)
+            callbacks.append(callback)
+            cost_input = CostInput(coordinates=q[itime, :].T, body_scales=s,
+                                   marker_offsets=mo, frame_offsets=fo)
+            errors[itime] = callback(cost_input)
 
-        # Compute total cost.
-        f_track = self.compute_average_trapezoidal_error(tracking_errors, times)
-        f_scale_reg = self.compute_scale_regularization(
-            s, weight=self.body_scale_regularization_weight)
-        f_offset_reg = self.compute_scale_regularization(
-            ca.vertcat(mo, fo), weight=self.offset_regularization_weight, target=0.0)
-        f = f_track + f_scale_reg + f_offset_reg
+        # Compute the total cost.
+        f = self.compute_average_trapezoidal_error(errors, times)
+        trial_input = CostInput(body_scales=s, marker_offsets=mo, frame_offsets=fo)
+        for cost in self.costs:
+            f += cost(trial_input)
 
         # Solve.
         nlp = {'x': ca.vertcat(ca.vec(coeffs), s, mo, fo), 'f': f}
@@ -1027,27 +884,31 @@ class SplineBasedBilevelSolver(SplineBasedSolverMixin, BilevelSolver):
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
         sol = solver(x0=x0, lbx=lbx, ubx=ubx)
 
-        # Reconstruct the optimal trajectory by evaluating the spline at the
-        # input data time points.
-        num_coeff_vars = num_knots * len(self.q_indexes)
+        # Reconstruct the optimal trajectory by evaluating the spline at the input data
+        # time points.
+        num_coeff_vars = num_knots * len(self.coordinate_indexes)
         coeffs_opt = ca.reshape(sol['x'][:num_coeff_vars], num_knots,
-                                len(self.q_indexes))
+                                len(self.coordinate_indexes))
         q_opt = np.array(B @ coeffs_opt)
         qdot_opt = np.array(dB @ coeffs_opt)
 
-        # Slice each parameter's optimized value from the flat solution vector.
-        x_flat = np.array(sol['x']).flatten()
-        i = num_coeff_vars
-        for p in ordered:
-            p.value = x_flat[i : i + p.num_variables].reshape(-1)
-            i += p.num_variables
-        solution_parameters = [p.with_value(p.value) for p in self.parameters]
+        # Slice each parameter's optimized value from the flat solution vector, when any
+        # parameters were registered.
+        solution_parameters = None
+        if num_params > 0:
+            x_flat = np.array(sol['x']).flatten()
+            i = num_coeff_vars
+            for p in self.parameters:
+                p.value = x_flat[i : i + p.num_variables].reshape(-1)
+                i += p.num_variables
+            solution_parameters = [p.with_value(p.value) for p in self.parameters]
 
-        return SplineBilevelSolution(
-            states_table=TrackingSolution.create_states_table(
-                self.mc.model, self.state, self.q_indexes, times, q_opt, qdot_opt),
-            parameters=solution_parameters,
+        return SplinedKinematicsSolution(
+            states_table=Solution.create_states_table(
+                self.mc.model, self.state, self.coordinate_indexes,
+                times, q_opt, qdot_opt),
             spline_nodes=np.array(coeffs_opt),
+            parameters=solution_parameters,
         )
 
 
@@ -1084,6 +945,7 @@ class MarkerPlacer(Solver):
         See `Solver`.
     """
     _guess_type = MarkerPlacerSolution
+    SUPPORTED_INPUTS = frozenset({'coordinates', 'marker_offsets'})
 
     def __init__(self, model: osim.Model, marker_source: MarkerSource,
                  marker_index: int = 0, offset_bounds: Bounds = Bounds(-0.5, 0.5),
@@ -1112,11 +974,11 @@ class MarkerPlacer(Solver):
                                          initial_offset)
             marker_offset.validate(self.mc)
             marker_offsets.append(marker_offset)
-        marker_offset_groups = [mo.to_group() for mo in marker_offsets]
+        self.mc.marker_offset_groups = [mo.to_group() for mo in marker_offsets]
 
         # Define variables.
         num_markers = sum(mo.num_variables for mo in marker_offsets)
-        q = ca.MX.sym('q', len(self.q_indexes))
+        q = ca.MX.sym('q', len(self.coordinate_indexes))
         s = ca.MX.sym('body_scales', 0)
         mo = ca.MX.sym('marker_offsets', num_markers)
         fo = ca.MX.sym('frame_offsets', 0)
@@ -1125,7 +987,7 @@ class MarkerPlacer(Solver):
         x0 = []
         lbx = []
         ubx = []
-        for coord_path in self.q_map:
+        for coord_path in self.coordinate_map:
             coord = osim.Coordinate.safeDownCast(self.mc.model.getComponent(coord_path))
             x0.append(coord.getDefaultValue())
             lbx.append(coord.getRangeMin())
@@ -1133,16 +995,21 @@ class MarkerPlacer(Solver):
         for marker_offset in marker_offsets:
             marker_offset.append_guess_and_bounds(x0, lbx, ubx)
 
-        # Define the cost bilevel function.
-        callback = BilevelCostFunction('marker_placer_cost', self.mc, [],
-                                       marker_offset_groups, [])
-        marker_index_of = {path: i for i, grp in enumerate(marker_offset_groups)
+        # Define the cost bilevel function. It reads its parameter groups from the
+        # ModelCache.
+        callback = BilevelCostFunction('marker_placer_cost', self.mc)
+        marker_index_of = {path: i
+                           for i, grp in enumerate(self.mc.marker_offset_groups)
                            for path in grp.component_paths}
         for imarker, marker_path in enumerate(marker_paths):
-            callback.add_marker_bilevel_cost(marker_path,
+            callback.add_marker_bilevel_cost_term(marker_path,
                 positions.getRowAtIndex(self.marker_index).getElt(0, imarker),
                 weight=1.0, offset_group_index=marker_index_of.get(marker_path))
-        f = callback(q, s, mo, fo)
+        cost_input = CostInput(coordinates=q, body_scales=s, marker_offsets=mo,
+                               frame_offsets=fo)
+        f = callback(cost_input)
+        for cost in self.costs:
+            f += cost(cost_input)
 
         # Solve.
         nlp = {'x': ca.vertcat(q, s, mo, fo), 'f': f}
@@ -1153,7 +1020,7 @@ class MarkerPlacer(Solver):
 
         # Slice the optimized pose and marker offsets from the flat solution vector.
         x_flat = np.array(sol['x']).flatten()
-        num_coords = len(self.q_indexes)
+        num_coords = len(self.coordinate_indexes)
         pose = x_flat[:num_coords]
         i = num_coords
         for marker_offset in marker_offsets:

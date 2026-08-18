@@ -7,8 +7,9 @@ from osimfit.data_sources import MarkerSource
 from osimfit.scaling import (Axis, PositionBasedScaler, MarkerMeasurement,
                              AnthropometricMeasurement, AnthropometricScaler)
 from osimfit.solvers import (InverseKinematicsSolver, MarkerPlacer,
-                             SplineBasedBilevelSolver, SplineBilevelSolution)
+                             SplinedKinematicsSolver, SplinedKinematicsSolution)
 from osimfit.model import BodyScale, MarkerOffset
+from osimfit.costs import BodyScaleRegularizationCost, OffsetRegularizationCost
 from osimfit.bounds import Bounds
 from osimfit.utilities import (compute_marker_errors, plot_marker_errors,
                                plot_coordinates)
@@ -272,15 +273,15 @@ states_traj = osim.StatesTrajectory.createFromStatesTable(anthro_scaled_model,
 
 # Spline-based inverse kinematics
 # -------------------------------
-# Construct a SplineBasedBilevelSolver to solve for the model kinematics and body
+# Construct a SplinedKinematicsSolver to solve for the model kinematics and body
 # lengths that best match the marker data.
-solver = SplineBasedBilevelSolver(unscaled_model,
-                                  convergence_tolerance=1e-3,
-                                  knot_interval=0.05,
-                                  position_weight=1.0,
-                                  body_scale_regularization_weight=1e-1,
-                                  offset_regularization_weight=1e-3)
+solver = SplinedKinematicsSolver(unscaled_model,
+                                 convergence_tolerance=1e-3,
+                                 knot_interval=0.05,
+                                 position_weight=1.0)
 solver.add_marker_reference_data(marker_source)
+solver.add_cost(BodyScaleRegularizationCost(1e-1))
+solver.add_cost(OffsetRegularizationCost(1e-3))
 # Add body scales for each body in the model. Apply the same scales to groups of bodies,
 # including those that should share left-right symmetry.
 bounds = Bounds(0.5, 1.5)
@@ -330,7 +331,7 @@ for scale in body_scales:
 
 # Create an initial guess based on the the kinematics from the inverse kinematics
 # solution and the combined body scales set above.
-guess = SplineBilevelSolution(
+guess = SplinedKinematicsSolution(
     states_table=osim.TimeSeriesTable('run_ik_solution.sto'),
     parameters=parameters_guess)
 bilevel_solution = solver.solve(guess)

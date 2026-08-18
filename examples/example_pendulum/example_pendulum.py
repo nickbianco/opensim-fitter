@@ -2,8 +2,9 @@ import os
 import numpy as np
 import opensim as osim
 from osimfit.data_sources import MarkerSource
-from osimfit.solvers import SplineBasedBilevelSolver
+from osimfit.solvers import SplinedKinematicsSolver
 from osimfit.model import BodyScale
+from osimfit.costs import BodyScaleRegularizationCost
 from osimfit.bounds import Bounds
 
 # EXAMPLE PENDULUM
@@ -98,14 +99,14 @@ labels = marker_table.getColumnLabels()
 label_map = {label: label.replace('|location', '') for label in labels}
 marker_source = MarkerSource('markers.trc', label_map=label_map)
 
-# Construct a SplineBasedBilevelSolver to solve for the model kinematics and body
+# Construct a SplinedKinematicsSolver to solve for the model kinematics and body
 # lengths that best match the marker data.
-solver = SplineBasedBilevelSolver(model,
-                                  convergence_tolerance=1e-5,
-                                  knot_interval=0.05,
-                                  position_weight=5.0,
-                                  body_scale_regularization_weight=1e-2)
+solver = SplinedKinematicsSolver(model,
+                                 convergence_tolerance=1e-5,
+                                 knot_interval=0.05,
+                                 position_weight=5.0)
 solver.add_marker_reference_data(marker_source)
+solver.add_cost(BodyScaleRegularizationCost(1e-2))
 # Add body scales for the two bodies including lower and upper bounds for the
 # optimization variables.
 solver.add_parameter(BodyScale('/bodyset/b0', Bounds(0.5, 2.0), np.ones(3)))

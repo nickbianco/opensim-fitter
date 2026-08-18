@@ -2,7 +2,7 @@
 End-to-end regression test mirroring examples/example_pendulum/example_pendulum.py.
 
 Synthesizes marker data from a double pendulum with known body lengths
-(1.25 m and 0.75 m), then runs SplineBasedBilevelSolver against an unscaled
+(1.25 m and 0.75 m), then runs SplinedKinematicsSolver against an unscaled
 model (both lengths = 1.0 m) and asserts the recovered body scales recover
 the ground-truth lengths.
 """
@@ -11,8 +11,9 @@ import opensim as osim
 import numpy as np
 
 from osimfit.data_sources import MarkerSource
-from osimfit.solvers import SplineBasedBilevelSolver
+from osimfit.solvers import SplinedKinematicsSolver
 from osimfit.model import BodyScale
+from osimfit.costs import BodyScaleRegularizationCost
 from osimfit.bounds import Bounds
 
 
@@ -104,14 +105,14 @@ def test_pendulum_bilevel_recovers_ground_truth_lengths(tmp_path):
 
     marker_source = MarkerSource(trc_path, label_map=label_map)
 
-    solver = SplineBasedBilevelSolver(
+    solver = SplinedKinematicsSolver(
         unscaled_model,
         convergence_tolerance=1e-5,
         knot_interval=0.05,
         position_weight=5.0,
-        body_scale_regularization_weight=1e-2,
     )
     solver.add_marker_reference_data(marker_source)
+    solver.add_cost(BodyScaleRegularizationCost(1e-2))
     solver.add_parameter(BodyScale('/bodyset/b0', Bounds(0.5, 2.0), np.ones(3)))
     solver.add_parameter(BodyScale('/bodyset/b1', Bounds(0.5, 2.0), np.ones(3)))
 
@@ -159,14 +160,14 @@ def test_pendulum_bilevel_recovers_shared_length_under_asymmetric_truth(
 
     marker_source = MarkerSource(trc_path, label_map=label_map)
 
-    solver = SplineBasedBilevelSolver(
+    solver = SplinedKinematicsSolver(
         unscaled_model,
         convergence_tolerance=1e-5,
         knot_interval=0.05,
         position_weight=5.0,
-        body_scale_regularization_weight=1e-2,
     )
     solver.add_marker_reference_data(marker_source)
+    solver.add_cost(BodyScaleRegularizationCost(1e-2))
     solver.add_parameter(BodyScale(
         ['/bodyset/b0', '/bodyset/b1'], Bounds(0.5, 2.0), np.ones(3)))
 
@@ -213,14 +214,14 @@ def test_pendulum_update_model_applies_recovered_body_scales(tmp_path):
     unscaled_model.initSystem()
 
     marker_source = MarkerSource(trc_path, label_map=label_map)
-    solver = SplineBasedBilevelSolver(
+    solver = SplinedKinematicsSolver(
         unscaled_model,
         convergence_tolerance=1e-5,
         knot_interval=0.05,
         position_weight=5.0,
-        body_scale_regularization_weight=1e-2,
     )
     solver.add_marker_reference_data(marker_source)
+    solver.add_cost(BodyScaleRegularizationCost(1e-2))
     solver.add_parameter(BodyScale('/bodyset/b0', Bounds(0.5, 2.0), np.ones(3)))
     solver.add_parameter(BodyScale('/bodyset/b1', Bounds(0.5, 2.0), np.ones(3)))
     solution = solver.solve()

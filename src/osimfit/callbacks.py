@@ -3,6 +3,7 @@ import casadi as ca
 import opensim as osim
 from abc import ABC, abstractmethod
 from .model import ModelCache, BodyScaleGroup, MarkerOffsetGroup, FrameOffsetGroup
+from .costs import Cost, CostInput
 
 
 ###########
@@ -155,15 +156,15 @@ class FrameTasks(Tasks):
         self.offset_group_indexes.append(offset_group_index)
 
 
-#########
-# COSTS #
-#########
+##############
+# COST TERMS #
+##############
 
-class TrackingCost(ABC):
+class TrackingTerm(ABC):
     """
-    A base class for tracking cost functions that compute a scalar error and its
+    A base class for tracking cost terms that compute a scalar error and its
     Jacobian with respect to the model's generalized coordinates, body scales,
-    and other optimization variables. To implement a new tracking cost, extend this
+    and other optimization variables. To implement a new tracking cost term, extend this
     class and implement the abstract methods (calc_error, calc_jacobian) to compute the
     error and its Jacobian.
     """
@@ -179,11 +180,11 @@ class TrackingCost(ABC):
         pass
 
 
-class FrameTrackingCost(FrameTasks, TrackingCost):
+class FrameTrackingTerm(FrameTasks, TrackingTerm):
     """
-    A tracking cost that computes the aggregate error between model frames' positions
-    and orientations and corresponding reference data as a function of the model's
-    generalized coordinates. Individual frames are registered via add_frame().
+    A tracking cost term that computes the aggregate error between model frames'
+    positions and orientations and corresponding reference data as a function of the
+    model's generalized coordinates. Individual frames are registered via add_frame().
 
     Parameters
     ----------
@@ -211,7 +212,7 @@ class FrameTrackingCost(FrameTasks, TrackingCost):
 
     def calc_jacobian(self, state, **kwargs) -> list[np.ndarray]:
         if self.num_tasks == 0:
-            return [np.zeros((1, len(self.mc.q_indexes)))]
+            return [np.zeros((1, len(self.mc.coordinate_indexes)))]
 
         # Loop over all frames and compute the "spatial error" (i.e., the combined
         # position and orientation error) for each.
@@ -244,14 +245,14 @@ class FrameTrackingCost(FrameTasks, TrackingCost):
             state, self.mobod_indexes, self.stations, spatialError, vec)
         J = vec.to_numpy()
 
-        return [np.expand_dims(J[self.mc.q_indexes], axis=0)]
+        return [np.expand_dims(J[self.mc.coordinate_indexes], axis=0)]
 
 
-class MarkerTrackingCost(MarkerTasks, TrackingCost):
+class MarkerTrackingTerm(MarkerTasks, TrackingTerm):
     """
-    A tracking cost that computes the aggregate error between model markers' positions
-    and corresponding reference positions as a function of the model's generalized
-    coordinates. Individual markers are registered via add_marker().
+    A tracking cost term that computes the aggregate error between model markers'
+    positions and corresponding reference positions as a function of the model's
+    generalized coordinates. Individual markers are registered via add_marker().
 
     Parameters
     ----------
@@ -273,7 +274,7 @@ class MarkerTrackingCost(MarkerTasks, TrackingCost):
 
     def calc_jacobian(self, state, **kwargs) -> list[np.ndarray]:
         if self.num_tasks == 0:
-            return [np.zeros((1, len(self.mc.q_indexes)))]
+            return [np.zeros((1, len(self.mc.coordinate_indexes)))]
 
         # Inialize the array used to calculate the position error Jacobian via the
         # grouped Simbody operator.
@@ -291,21 +292,20 @@ class MarkerTrackingCost(MarkerTasks, TrackingCost):
         self.mc.model.multiplyByStationJacobianTranspose(
             state, self.mobod_indexes, self.stations, f_GP, vec)
 
-        return [np.expand_dims(vec.to_numpy()[self.mc.q_indexes], axis=0)]
+        return [np.expand_dims(vec.to_numpy()[self.mc.coordinate_indexes], axis=0)]
 
 
-class BilevelCost(TrackingCost):
+class BilevelTerm(TrackingTerm):
     """
-    An intermediate base class that provides functionality common to bilevel
-    optimization costs.
+    An intermediate base class that provides functionality common to bilevel cost terms.
     """
     def __init__(self):
         super().__init__()
 
 
-class MarkerBilevelCost(MarkerTasks, BilevelCost):
+class MarkerBilevelTerm(MarkerTasks, BilevelTerm):
     """
-    A tracking cost that computes the aggregate error between model markers' scaled
+    A tracking cost term that computes the aggregate error between model markers' scaled
     positions and corresponding reference positions as a function of the model's
     generalized coordinates and body scales. Individual markers are registered via
     add_marker().
@@ -315,22 +315,12 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
     mc: ModelCache
         The `ModelCache` wrapping the OpenSim model used for
         evaluating the function and its Jacobian and caching model information.
-    body_scale_groups: list[BodyScaleGroup]
-        Groups of bodies each sharing one set of XYZ body scales. Each entry
-        contains a list of mobilized body indexes defining which bodies are scaled and
-        how Jacobian columns are aggregated.
-    offset_groups: list[MarkerOffsetGroup]
-        Groups of component paths indicating markers whose offset translations will
-        be adjusted in the bilevel optimization problem.
     """
-    def __init__(self, mc: ModelCache, body_scale_groups: list[BodyScaleGroup],
-                 offset_groups: list[MarkerOffsetGroup]):
+    def __init__(self, mc: ModelCache):
         self.mc = mc
         self.initialize_tasks()
-        self.body_scale_groups = body_scale_groups
-        self.offset_groups = offset_groups
         self.mobod_to_scale_group: dict[int, int] = {
-            int(k): g for g, group in enumerate(self.body_scale_groups)
+            int(k): g for g, group in enumerate(self.mc.body_scale_groups)
             for k in group.mobod_indexes}
 
     def apply_scales(self, body_scales: np.ndarray) -> None:
@@ -369,9 +359,9 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
         return error
 
     def calc_jacobian(self, state, **kwargs) -> list[np.ndarray]:
-        Jq = np.zeros((1, len(self.mc.q_indexes)))
-        Js = np.zeros((1, 3 * len(self.body_scale_groups)))
-        Jo = np.zeros((1, 3 * len(self.offset_groups)))
+        Jq = np.zeros((1, len(self.mc.coordinate_indexes)))
+        Js = np.zeros((1, 3 * len(self.mc.body_scale_groups)))
+        Jo = np.zeros((1, 3 * len(self.mc.marker_offset_groups)))
         if self.num_tasks == 0:
             return [Jq, Js, Jo]
 
@@ -395,7 +385,7 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
         vec = osim.Vector(state.getNQ(), 0.0)
         self.mc.model.multiplyByStationJacobianTranspose(
             state, self.mobod_indexes, self.stations, dp_GS, vec)
-        Jq[0, :] = vec.to_numpy()[self.mc.q_indexes]
+        Jq[0, :] = vec.to_numpy()[self.mc.coordinate_indexes]
 
         # Scatter per-station gradients for each task into a vector respresenting the
         # error gradient with respect to body origins, which we need for the Jacobian
@@ -411,8 +401,7 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
             dp_GB.set(k, osim.Vec3(float(cur[0]), float(cur[1]), float(cur[2])))
 
         # Calculate the position-error Jacobian with respect to body scales.
-        Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB,
-                                                            self.body_scale_groups)
+        Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB)
 
         # Assemble the marker offset Jacobian based on the offset sensitivities. Also,
         # include the contributions from the marker offsets to the Jacobian with respect
@@ -430,9 +419,9 @@ class MarkerBilevelCost(MarkerTasks, BilevelCost):
         return [Jq, Js, Jo]
 
 
-class FrameBilevelCost(FrameTasks, BilevelCost):
+class FrameBilevelTerm(FrameTasks, BilevelTerm):
     """
-    A tracking cost that computes the aggregate error between model frames' scaled
+    A tracking cost term that computes the aggregate error between model frames' scaled
     positions and corresponding reference positions as a function of the model's
     generalized coordinates and body scales. Individual frames are registered via
     add_frame().
@@ -442,22 +431,12 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
     mc: ModelCache
         The `ModelCache` wrapping the OpenSim model used for
         evaluating the function and its Jacobian and caching model information.
-    body_scale_groups: list[BodyScaleGroup]
-        Groups of bodies each sharing one set of XYZ body scales. Each entry
-        contains a list of mobilized body indexes defining which bodies are scaled and
-        how Jacobian columns are aggregated.
-    offset_groups: list[FrameOffsetGroup]
-        Groups of component paths indicating frames whose offset translations will
-        be adjusted in the bilevel optimization problem.
     """
-    def __init__(self, mc: ModelCache, body_scale_groups: list[BodyScaleGroup],
-                 offset_groups: list[FrameOffsetGroup]):
+    def __init__(self, mc: ModelCache):
         self.mc = mc
         self.initialize_tasks()
-        self.body_scale_groups = body_scale_groups
-        self.offset_groups = offset_groups
         self.mobod_to_scale_group: dict[int, int] = {
-            int(k): g for g, group in enumerate(self.body_scale_groups)
+            int(k): g for g, group in enumerate(self.mc.body_scale_groups)
             for k in group.mobod_indexes}
 
     def apply_scales(self, body_scales: np.ndarray) -> None:
@@ -502,9 +481,9 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
         return error
 
     def calc_jacobian(self, state, **kwargs) -> list[np.ndarray]:
-        Jq = np.zeros((1, len(self.mc.q_indexes)))
-        Js = np.zeros((1, 3 * len(self.body_scale_groups)))
-        Jo = np.zeros((1, 3 * len(self.offset_groups)))
+        Jq = np.zeros((1, len(self.mc.coordinate_indexes)))
+        Js = np.zeros((1, 3 * len(self.mc.body_scale_groups)))
+        Jo = np.zeros((1, 3 * len(self.mc.frame_offset_groups)))
         if self.num_tasks == 0:
             return [Jq, Js, Jo]
 
@@ -549,7 +528,7 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
         vec = osim.Vector(state.getNQ(), 0.0)
         self.mc.model.multiplyByFrameJacobianTranspose(
             state, self.mobod_indexes, self.stations, spatialError, vec)
-        Jq[0, :] = vec.to_numpy()[self.mc.q_indexes]
+        Jq[0, :] = vec.to_numpy()[self.mc.coordinate_indexes]
 
         # Scatter per-station gradients for each task into a vector respresenting the
         # error gradient with respect to body origins, which we need for the Jacobian
@@ -566,8 +545,7 @@ class FrameBilevelCost(FrameTasks, BilevelCost):
 
         # Calculate the position-error Jacobian with respect to body scales. This does
         # not include the contributions from frame offsets, we will include that below.
-        Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB,
-                                                            self.body_scale_groups)
+        Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB)
 
         # Assemble the frame offset Jacobian based on the offset sensitivities. Also,
         # include the contributions from the frame offsets to the Jacobian with respect
@@ -691,10 +669,44 @@ class Function(ca.Callback, ABC):
 # COST FUNCTIONS #
 ##################
 
-class TrackingCostFunction(Function):
+class CallbackCost(Cost, Function):
     """
-    A CasADi callback that evaluates the sum of tracking costs over a set of model
-    frames and markers with respect to the model's generalized coordinates.
+    A `Cost` function backed by a CasADi callback function.
+    """
+    required_inputs = frozenset({'coordinates'})
+
+    def __call__(self, input: CostInput) -> ca.MX:
+        return ca.Function.__call__(
+            self, *(getattr(input, name) for name in CostInput.INPUT_ORDER))
+
+    def _get_num_inputs(self):
+        return len(CostInput.INPUT_ORDER)
+
+    def _get_num_outputs(self):
+        return 1
+
+    def _get_input_size(self, i):
+        sizes = {
+            'coordinates': len(self.mc.coordinate_indexes),
+            'body_scales': 3 * len(self.mc.body_scale_groups),
+            'marker_offsets': 3 * len(self.mc.marker_offset_groups),
+            'frame_offsets': 3 * len(self.mc.frame_offset_groups),
+        }
+        order = CostInput.INPUT_ORDER
+        if not 0 <= i < len(order):
+            raise IndexError(f'Invalid input index {i} for {type(self).__name__}.')
+        return sizes[order[i]]
+
+    def _get_output_size(self, i):
+        if i == 0:
+            return 1
+        raise IndexError(f'Invalid output index {i} for {type(self).__name__}.')
+
+
+class TrackingCostFunction(CallbackCost):
+    """
+    A callback cost function that evaluates the sum of tracking cost terms over a set of
+    model frames and markers with respect to the model's generalized coordinates.
 
     Parameters
     ----------
@@ -708,8 +720,8 @@ class TrackingCostFunction(Function):
     """
     def __init__(self, name: str, mc: ModelCache, opts={}):
         Function.__init__(self, name, mc, opts=opts)
-        self.marker_cost = MarkerTrackingCost(mc)
-        self.frame_cost = FrameTrackingCost(mc)
+        self.marker_term = MarkerTrackingTerm(mc)
+        self.frame_term = FrameTrackingTerm(mc)
 
     def apply_state(self, arg):
         """
@@ -717,59 +729,42 @@ class TrackingCostFunction(Function):
         position stage.
         """
         q = np.zeros(self.state.getNQ())
-        q[self.mc.q_indexes] = np.squeeze(arg[0].full())
+        q[self.mc.coordinate_indexes] = np.squeeze(arg[0].full())
         self.state.setQ(osim.Vector.createFromMat(q))
         self.mc.model.realizePosition(self.state)
 
-    def add_marker_tracking_cost(self, marker_path: str, position: osim.Vec3,
-                                 weight: float = 1.0):
-        self.marker_cost.add_marker(marker_path, position, weight=weight)
+    def add_marker_tracking_cost_term(self, marker_path: str, position: osim.Vec3,
+                                      weight: float = 1.0):
+        self.marker_term.add_marker(marker_path, position, weight=weight)
 
-    def add_frame_tracking_cost(self, frame_path: str,
-                                position: osim.Vec3,
-                                orientation: osim.Quaternion,
-                                position_weight: float = 1.0,
-                                orientation_weight: float = 1.0):
-        self.frame_cost.add_frame(frame_path, position, orientation,
+    def add_frame_tracking_cost_term(self, frame_path: str,
+                                     position: osim.Vec3,
+                                     orientation: osim.Quaternion,
+                                     position_weight: float = 1.0,
+                                     orientation_weight: float = 1.0):
+        self.frame_term.add_frame(frame_path, position, orientation,
                                   position_weight=position_weight,
                                   orientation_weight=orientation_weight)
 
-    def _get_num_inputs(self):
-        return 1
-
-    def _get_num_outputs(self):
-        return 1
-
-    def _get_input_size(self, i):
-        if i == 0:
-            return len(self.mc.q_indexes)
-        else:
-            raise IndexError(f'Invalid input index {i} for TrackingCostFunction.')
-
-    def _get_output_size(self, i):
-        if i == 0:
-            return 1
-        else:
-            raise IndexError(f'Invalid output index {i} for TrackingCostFunction.')
-
     def _eval(self, arg):
         self.apply_state(arg)
-        error = (self.marker_cost.calc_error(self.state) +
-                 self.frame_cost.calc_error(self.state))
+        error = (self.marker_term.calc_error(self.state) +
+                 self.frame_term.calc_error(self.state))
         return [error]
 
     def _jac_eval(self, arg):
         self.apply_state(arg)
-        J = (self.marker_cost.calc_jacobian(self.state)[0] +
-             self.frame_cost.calc_jacobian(self.state)[0])
-        return [J]
+        J = (self.marker_term.calc_jacobian(self.state)[0] +
+             self.frame_term.calc_jacobian(self.state)[0])
+        empty = np.zeros((1, 0))
+        return [J, empty, empty, empty]
 
 
-class BilevelCostFunction(Function):
+class BilevelCostFunction(CallbackCost):
     """
-    A CasADi callback that evaluates the sum of tracking costs over a set of model
-    markers and frames with respect to the model's generalized coordinates, a set of
-    body scales, and a set of per-marker/frame XYZ placement offsets.
+    A callback cost function that evaluates the sum of tracking cost terms over a set of
+    model markers and frames with respect to the model's generalized coordinates, a set
+    of body scales, and a set of per-marker/frame XYZ placement offsets.
 
     Parameters
     ----------
@@ -777,35 +772,22 @@ class BilevelCostFunction(Function):
         The name of the callback function.
     mc: ModelCache
         The `ModelCache` wrapping the OpenSim model used for evaluating the function and
-        its Jacobian and caching model information.
-    body_scale_groups: list[BodyScaleGroup]
-        Groups of bodies each sharing one set of XYZ body scales. The i-th 3-vector of
-        body scales is broadcast to every body in `body_scale_groups[i]`.
-    marker_offset_groups: list[OffsetGroup]
-        Groups of marker paths whose offset translations will be adjusted in the bilevel
-        optimization problem. These occupy the callback's marker-offset input.
-    frame_offset_groups: list[OffsetGroup]
-        Groups of frame paths whose offset translations will be adjusted in the bilevel
-        optimization problem. These occupy the callback's frame-offset input.
+        its Jacobian and caching model information. Contains parameter information
+        (e.g., body scale groups) for relevant optimization parameters.
     opts: dict
         A dictionary of options to pass to the CasADi callback constructor.
     """
-    def __init__(self, name: str, mc: ModelCache,
-                 body_scale_groups: list[BodyScaleGroup],
-                 marker_offset_groups: list[MarkerOffsetGroup],
-                 frame_offset_groups: list[FrameOffsetGroup], opts={}):
-        self.body_scale_groups = body_scale_groups
-        self.marker_offset_groups = marker_offset_groups
-        self.frame_offset_groups = frame_offset_groups
+    required_inputs = frozenset(
+        {'coordinates', 'body_scales', 'marker_offsets', 'frame_offsets'})
+
+    def __init__(self, name: str, mc: ModelCache, opts={}):
         Function.__init__(self, name, mc, opts=opts)
-        self.marker_cost = MarkerBilevelCost(mc, self.body_scale_groups,
-                                             self.marker_offset_groups)
-        self.frame_cost = FrameBilevelCost(mc, self.body_scale_groups,
-                                           self.frame_offset_groups)
+        self.marker_term = MarkerBilevelTerm(mc)
+        self.frame_term = FrameBilevelTerm(mc)
 
         # Cache references to joints associated with each inboard and outboard frame in
         # each scale group.
-        for group in self.body_scale_groups:
+        for group in self.mc.body_scale_groups:
             group.outboard_joints = [
                 self.mc.get_joint_for_mobilized_body_index(int(k))
                 for k in group.mobod_indexes]
@@ -821,69 +803,43 @@ class BilevelCostFunction(Function):
         """
         body_scales = np.squeeze(arg[1].full())
         body_scales = np.atleast_1d(body_scales).astype(float)
-        self.mc.set_scaled_mobilizer_frame_positions(self.state,
-                                                     self.body_scale_groups,
-                                                     body_scales)
+        self.mc.set_scaled_mobilizer_frame_positions(self.state, body_scales)
 
         marker_offsets = np.atleast_1d(np.squeeze(arg[2].full())).astype(float)
-        self.marker_cost.apply_state(body_scales, marker_offsets)
+        self.marker_term.apply_state(body_scales, marker_offsets)
 
         frame_offsets = np.atleast_1d(np.squeeze(arg[3].full())).astype(float)
-        self.frame_cost.apply_state(body_scales, frame_offsets)
+        self.frame_term.apply_state(body_scales, frame_offsets)
 
         q = np.zeros(self.state.getNQ())
-        q[self.mc.q_indexes] = np.squeeze(arg[0].full())
+        q[self.mc.coordinate_indexes] = np.squeeze(arg[0].full())
         self.state.setQ(osim.Vector.createFromMat(q))
         self.mc.model.realizePosition(self.state)
 
-    def add_marker_bilevel_cost(self, marker_path: str, position: osim.Vec3,
-                                weight: float = 1.0,
-                                offset_group_index: int | None = None):
-        self.marker_cost.add_marker(marker_path, position, weight=weight,
+    def add_marker_bilevel_cost_term(self, marker_path: str, position: osim.Vec3,
+                                     weight: float = 1.0,
+                                     offset_group_index: int | None = None):
+        self.marker_term.add_marker(marker_path, position, weight=weight,
                                     offset_group_index=offset_group_index)
 
-    def add_frame_bilevel_cost(self, frame_path: str, position: osim.Vec3,
-                               orientation: osim.Quaternion,
-                               position_weight: float = 1.0,
-                               orientation_weight: float = 1.0,
-                               offset_group_index: int | None = None):
-        self.frame_cost.add_frame(frame_path, position, orientation, position_weight,
+    def add_frame_bilevel_cost_term(self, frame_path: str, position: osim.Vec3,
+                                    orientation: osim.Quaternion,
+                                    position_weight: float = 1.0,
+                                    orientation_weight: float = 1.0,
+                                    offset_group_index: int | None = None):
+        self.frame_term.add_frame(frame_path, position, orientation, position_weight,
                                   orientation_weight,
                                   offset_group_index=offset_group_index)
-
-    def _get_num_inputs(self):
-        return 4
-
-    def _get_num_outputs(self):
-        return 1
-
-    def _get_input_size(self, i):
-        if i == 0:
-            return len(self.mc.q_indexes)
-        elif i == 1:
-            return 3 * len(self.body_scale_groups)
-        elif i == 2:
-            return 3 * len(self.marker_offset_groups)
-        elif i == 3:
-            return 3 * len(self.frame_offset_groups)
-        else:
-            raise IndexError(f'Invalid input index {i} for BilevelCostFunction.')
-
-    def _get_output_size(self, i):
-        if i == 0:
-            return 1
-        else:
-            raise IndexError(f'Invalid output index {i} for BilevelCostFunction.')
 
     def _eval(self, arg):
         self.apply_state(arg)
         error = 0
-        error += self.marker_cost.calc_error(self.state)
-        error += self.frame_cost.calc_error(self.state)
+        error += self.marker_term.calc_error(self.state)
+        error += self.frame_term.calc_error(self.state)
         return [error]
 
     def _jac_eval(self, arg):
         self.apply_state(arg)
-        Jq_m, Js_m, Jmo = self.marker_cost.calc_jacobian(self.state)
-        Jq_f, Js_f, Jfo = self.frame_cost.calc_jacobian(self.state)
+        Jq_m, Js_m, Jmo = self.marker_term.calc_jacobian(self.state)
+        Jq_f, Js_f, Jfo = self.frame_term.calc_jacobian(self.state)
         return [Jq_m + Jq_f, Js_m + Js_f, Jmo, Jfo]

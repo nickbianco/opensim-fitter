@@ -6,9 +6,8 @@ import opensim as osim
 from osimfit.data_sources import TheiaFrameSource
 from osimfit.scaling import PositionBasedScaler, FrameMeasurement, Axis, \
                             AnthropometricScaler, AnthropometricMeasurement
-from osimfit.solvers import (InverseKinematicsSolver,
-                             SplineBasedInverseKinematicsSolver,
-                             SplineTrackingSolution)
+from osimfit.solvers import (InverseKinematicsSolver, SplinedKinematicsSolver,
+                             SplinedKinematicsSolution)
 from osimfit.model import BodyScale
 from osimfit.bounds import Bounds
 
@@ -195,18 +194,18 @@ sto.write(ik_solution.states_table, 'jump_1_ik_solution.sto')
 
 # Spline-based bilevel optimization
 # ----------------------------------
-# Construct a SplineBasedBilevelSolver to solve for the model kinematics and body
+# Construct a SplinedKinematicsSolver to solve for the model kinematics and body
 # scales that best match the Theia frame data, initialized from the unscaled model.
-solver = SplineBasedInverseKinematicsSolver(anthro_scaled_model,
-                                            convergence_tolerance=1e-4,
-                                            knot_interval=0.05,
-                                            position_weight=5.0,
-                                            orientation_weight=10.0)
+solver = SplinedKinematicsSolver(unscaled_model,
+                                 convergence_tolerance=1e-3,
+                                 knot_interval=0.05,
+                                 position_weight=2.0,
+                                 orientation_weight=5.0)
 solver.add_theia_frame_reference_data(theia_frame_source)
 
 # Create an initial guess based on the kinematics from the frame-by-frame inverse
 # kinematics solution and the combined body scales set above.
-guess = SplineTrackingSolution(
+guess = SplinedKinematicsSolution(
     states_table=osim.TimeSeriesTable('jump_1_ik_solution.sto'))
 spline_ik_solution = solver.solve(guess)
 sto = osim.STOFileAdapter()
