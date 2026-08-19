@@ -484,8 +484,7 @@ def compute_marker_errors(model: osim.Model, states: osim.StatesTrajectory,
     return errors
 
 
-def plot_marker_errors(errors: osim.TimeSeriesTableVec3, pdf_fpath: str,
-                       max_error: float=10.0):
+def plot_marker_errors(errors: osim.TimeSeriesTableVec3, pdf_fpath: str):
     """
     Plot marker errors across time and save to a PDF.
 
@@ -498,9 +497,13 @@ def plot_marker_errors(errors: osim.TimeSeriesTableVec3, pdf_fpath: str,
         in ground for each marker. Marker errors are expected to be in meters.
     pdf_fpath: str
         The file path where the PDF of marker error plots should be saved.
-    max_error: float, optional
-        The maximum error (in cm) to show on the y-axis of the plots. Errors above this
-        threshold will be shaded in red to highlight them. Default is 10.0 cm.
+
+    Returns
+    -------
+    mean_errors: dict[str, float]
+        Per-marker mean error magnitude (cm), keyed by marker label.
+    max_errors: dict[str, float]
+        Per-marker maximum error magnitude (cm), keyed by marker label.
     """
 
     # Extract error magnitudes (m -> cm).
@@ -517,9 +520,16 @@ def plot_marker_errors(errors: osim.TimeSeriesTableVec3, pdf_fpath: str,
             error_norms[i, j] = np.sqrt(vec.get(0)**2 + vec.get(1)**2 + vec.get(2)**2)
     error_norms *= 100  # m -> cm
 
+    # Per-marker mean and max error magnitudes (cm), keyed by marker label.
+    mean_errors = {label: float(np.mean(error_norms[:, j]))
+                   for j, label in enumerate(marker_labels)}
+    max_errors = {label: float(np.max(error_norms[:, j]))
+                  for j, label in enumerate(marker_labels)}
+
     # Plot marker errors to PDF, 12 per page (4 rows x 3 cols).
     PLOTS_PER_PAGE = 12
     ROWS, COLS = 4, 3
+    MAX_ERROR = 10.0
 
     with PdfPages(pdf_fpath) as pdf:
         n_pages = int(np.ceil(n_markers / PLOTS_PER_PAGE))
@@ -535,12 +545,14 @@ def plot_marker_errors(errors: osim.TimeSeriesTableVec3, pdf_fpath: str,
                     ax.set_visible(False)
                     continue
 
+                label = marker_labels[marker_idx]
                 err = error_norms[:, marker_idx]
-                max_err = np.max(err)
-                y_max = max_error if max_err <= max_error else max_err * 1.1
+                mean_err = mean_errors[label]
+                max_err = max_errors[label]
+                y_max = MAX_ERROR if max_err <= MAX_ERROR else max_err * 1.1
 
-                if max_err > max_error:
-                    ax.axhspan(max_error, y_max, color='lightcoral',
+                if max_err > MAX_ERROR:
+                    ax.axhspan(MAX_ERROR, y_max, color='lightcoral',
                                alpha=0.4, zorder=0)
 
                 ax.plot(time, err, linewidth=2.0)
@@ -548,12 +560,21 @@ def plot_marker_errors(errors: osim.TimeSeriesTableVec3, pdf_fpath: str,
                 ax.axhline(4.0, color='red', linestyle='--', linewidth=0.5)
                 ax.set_xlim(time[0], time[-1])
                 ax.set_ylim(0, y_max)
-                ax.set_title(marker_labels[marker_idx].split('/')[-1], fontsize=8)
+                ax.set_title(label.split('/')[-1], fontsize=8)
                 ax.set_xlabel('time (s)', fontsize=8)
                 ax.set_ylabel('error (cm)', fontsize=8)
                 ax.tick_params(labelsize=6)
                 ax.grid(True, linestyle='--', alpha=0.5)
 
+                # Annotate each plot with its mean and max error.
+                ax.text(0.97, 0.95,
+                        f'mean error: {mean_err:.2f} cm\n max error: {max_err:.2f} cm',
+                        transform=ax.transAxes, ha='right', va='top', fontsize=7,
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7,
+                                  edgecolor='0.7'))
+
             fig.tight_layout()
             pdf.savefig(fig)
             plt.close(fig)
+
+    return mean_errors, max_errors
