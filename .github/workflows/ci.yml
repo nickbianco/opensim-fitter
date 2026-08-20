@@ -48,7 +48,7 @@ jobs:
       - name: Run tests
         run: |
           export LD_LIBRARY_PATH=/home/runner/work/opensim-fitter/opensim-fitter/dependencies/opensim/opensim_core_install/sdk/Simbody/lib:$LD_LIBRARY_PATH
-          pytest tests/ -v
+          python -m pytest tests/ -v
 
   macos:
     name: macOS
@@ -84,7 +84,7 @@ jobs:
       - name: Run tests
         run: |
           export LD_LIBRARY_PATH=/home/runner/work/opensim-fitter/opensim-fitter/dependencies/opensim/opensim_core_install/sdk/Simbody/lib:$LD_LIBRARY_PATH
-          pytest tests/ -v
+          python -m pytest tests/ -v
 
   windows:
     name: Windows
@@ -118,4 +118,4 @@ jobs:
         run: pip install -e ".[test]"
 
       - name: Run tests
-        run: pytest tests/ -v
+        run: python -m pytest tests/ -v

@@ -104,12 +104,15 @@ scaled_model.printToXML('jump_1_scaled.osim')
 # Next, we will adjust the scaled model based on anthropometric measurements from the
 # ANSUR II dataset.
 
-# Define a mapping between ANSUR II measurement labels and pairs of stations (e.g.,
-# body-fixed points) representing the measurement, along with the axis along which to
-# apply the measurement. If no axis is specified, the measurement will be applied
-# isotropically.
-# ansur_label --> (station1_path, station2_path, axis)
-ansur_measurements = {
+# Create the AnthropometricScaler.
+anthropometric_scaler = AnthropometricScaler(scaled_model, sex='female')
+
+# Define the list of anthropometric measurements from the ANSUR II dataset to use in
+# the `AnthropometricScaler`. Each `AnthropometricMeasurement` object contains the name
+# of the measurement, paths to two `Station`s in the model from which the measurement is
+# computed, and the axis along which the measurement is taken. If no axis is specified,
+# the measurement is the Euclidean distance between the two stations.
+ansur_measurements_map = {
     'biacromialbreadth':      ('/acromion_r', '/acromion_l', None),
     'bicristalbreadth':       ('/iliocrestale_r', '/iliocrestale_l', None),
     'bimalleolarbreadth':     ('/lateral_malleolus_r', '/medial_malleolus_r', None),
@@ -124,21 +127,11 @@ ansur_measurements = {
     'tibialheight':           ('/tibiale_r', '/mtp5_r', Axis.YAxis),
     'trochanterionheight':    ('/trochanterion_r', '/mtp5_r', Axis.YAxis),
     'waistbacklength':        ('/cervicale', '/posterior_omphalion', None),
-    'waistdepth':             ('/posterior_omphalion', '/anterior_omphalion', None)
+    'waistdepth':             ('/posterior_omphalion', '/anterior_omphalion', None),
 }
-
-# Create the AnthropometricScaler and add measurements based on the mapping above.
-anthropometric_scaler = AnthropometricScaler(scaled_model, sex='female')
-
-# Build the measurements once so we can reuse them by label below.
-ansur_measurement_map = {
-    label: AnthropometricMeasurement(station1_path, station2_path, axis)
-    for label, (station1_path, station2_path, axis) in ansur_measurements.items()
-}
-
-# Register every measurement so it participates in the joint MVN distribution.
-for ansur_label, measurement in ansur_measurement_map.items():
-    anthropometric_scaler.add_measurement(ansur_label, measurement)
+for name, (station1_path, station2_path, axis) in ansur_measurements_map.items():
+    anthropometric_scaler.add_measurement(
+        AnthropometricMeasurement(name, station1_path, station2_path, axis))
 
 # Select of subset of the measurements that we will use to condition the
 # multivariate normal distribution. These measurements are "trustworthy" in the

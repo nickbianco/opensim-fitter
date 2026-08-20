@@ -1,13 +1,17 @@
 import os
-from matplotlib.pylab import mean, sample
-import scipy
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+import scipy.stats
+
 
 class MultivariateNormal:
+    """
+    A utility class for modeling a multivariate normal distribution. Uses internally
+    scipy.stats.multivariate_normal to store fitted distributions.
+    """
+
     @classmethod
-    def from_data(cls, variables, data):
+    def from_data(cls, variables: list[str], data: np.ndarray):
         """
         Create a MultivariateNormal from data.
 
@@ -26,7 +30,7 @@ class MultivariateNormal:
         mean, cov = scipy.stats.multivariate_normal.fit(data)
         return cls(variables, mean, cov)
 
-    def __init__(self, variables, mean, cov):
+    def __init__(self, variables: list[str], mean: np.ndarray, cov: np.ndarray):
         """
         Create a MultivariateNormal directly from the mean and covariance.
 
@@ -51,13 +55,13 @@ class MultivariateNormal:
         self.multivariate_normal = scipy.stats.multivariate_normal(
             mean=self.mean, cov=self.cov)
 
-    def _convert_values_from_dict(self, values):
+    def _convert_values_from_dict(self, values: dict[str, float]):
         """
         Convert a dictionary of variable values to an ndarray.
 
         Parameters
         ----------
-        values : dict
+        values : dict[str, float]
             A dictionary mapping variable names to their values.
 
         Returns
@@ -71,6 +75,17 @@ class MultivariateNormal:
                 raise ValueError(f'Variable {var} not in distribution.')
             x[self.variables.index(var)] = values[var]
         return x
+
+    def get_variables(self):
+        """
+        Get the names of the variables in the distribution.
+
+        Returns
+        -------
+        list of str
+            The names of the variables.
+        """
+        return self.variables
 
     def get_mean(self):
         """
@@ -116,7 +131,7 @@ class MultivariateNormal:
         """
         return self.multivariate_normal.rvs()
 
-    def get_pdf(self, values):
+    def get_pdf(self, values: np.ndarray):
         """
         Get the probability density function (PDF) value at a given point.
 
@@ -132,7 +147,7 @@ class MultivariateNormal:
         """
         return self.multivariate_normal.pdf(self._convert_values_from_dict(values))
 
-    def get_logpdf(self, values):
+    def get_logpdf(self, values: np.ndarray):
         """
         Get the log of the probability density function (PDF) value at a given point.
 
@@ -148,7 +163,7 @@ class MultivariateNormal:
         """
         return self.multivariate_normal.logpdf(self._convert_values_from_dict(values))
 
-    def get_cdf(self, values):
+    def get_cdf(self, values: np.ndarray):
         """
         Get the cumulative density function (CDF) value at a given point.
 
@@ -164,7 +179,7 @@ class MultivariateNormal:
         """
         return self.multivariate_normal.cdf(self._convert_values_from_dict(values))
 
-    def get_logcdf(self, values):
+    def get_logcdf(self, values: np.ndarray):
         """
         Get the log of the cumulative density function (CDF) value at a given point.
 
@@ -180,7 +195,7 @@ class MultivariateNormal:
         """
         return self.multivariate_normal.logcdf(self._convert_values_from_dict(values))
 
-    def condition(self, values):
+    def condition(self, values: dict[str, float]):
         """
         Condition the multivariate normal distribution on a subset of variables
         being equal to the specified 'values'. Returns a new MultivariateNormal instance
@@ -188,7 +203,7 @@ class MultivariateNormal:
 
         Parameters
         ----------
-        values : dict
+        values : dict[str, float]
             A dictionary mapping variable names to their observed values.
 
         Returns
@@ -216,7 +231,7 @@ class MultivariateNormal:
         variables_a = [self.variables[i] for i in idx_a]
         return MultivariateNormal(variables_a, mean_cond, cov_cond)
 
-    def get_variable_percentile(self, variable_name, value):
+    def get_variable_percentile(self, variable_name: str, value: float):
         """
         Calculate the percentile rank of a specific value for an individual variable.
 
@@ -238,7 +253,8 @@ class MultivariateNormal:
             If the variable is not in the distribution.
         """
         if variable_name not in self.variables:
-            raise ValueError(f"Variable '{variable_name}' not found in the distribution")
+            raise ValueError(
+                f"Variable '{variable_name}' not found in the distribution")
 
         # Get index of the variable
         var_idx = self.variables.index(variable_name)
@@ -248,106 +264,102 @@ class MultivariateNormal:
         var_std = np.sqrt(self.cov[var_idx, var_idx])
 
         # Create a normal distribution for this variable
-        var_dist = norm(var_mean, var_std)
+        var_dist = scipy.stats.norm(var_mean, var_std)
 
         # Calculate the percentile (CDF * 100)
         percentile = var_dist.cdf(value) * 100.0
 
         return percentile
 
+    def plot_variable_distribution(self, data_df: pd.DataFrame, variable_name: str,
+                                   bins: int=30):
+        """
+        Plot the fitted distribution versus actual data for a specific variable.
 
-def plot_variable_distribution(mvn, data_df, variable_name, bins=30):
+        Parameters
+        ----------
+        data_df: pandas.DataFrame
+            The original data
+        variable_name: str
+            Name of the variable to plot
+        bins: int, optional
+            Number of histogram bins (default: 30)
+        """
+        import matplotlib.pyplot as plt
+
+        # Check if variable exists in the distribution
+        if variable_name not in self.variables:
+            raise ValueError(
+                f"Variable '{variable_name}' not found in the distribution")
+
+        # Get index of the variable
+        var_idx = self.variables.index(variable_name)
+
+        # Get mean and standard deviation for this variable
+        var_mean = self.mean[var_idx]
+        var_std = np.sqrt(self.cov[var_idx, var_idx])
+
+        # Create a normal distribution for this variable
+        var_dist = scipy.stats.norm(var_mean, var_std)
+
+        # Plot histogram of actual data
+        plt.figure(figsize=(10, 6))
+        plt.hist(data_df[variable_name], bins=bins, density=True, alpha=0.6,
+                label='Actual data', color='skyblue')
+
+        # Plot the fitted distribution
+        x = np.linspace(var_mean - 4*var_std, var_mean + 4*var_std, 1000)
+        plt.plot(x, var_dist.pdf(x), 'r-', lw=2, label='Fitted normal distribution')
+
+        plt.title(f'Distribution of {variable_name}')
+        plt.xlabel(variable_name)
+        plt.ylabel('Density')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+
+def build_ansur_distribution(labels: list[str], sex: str = None) -> MultivariateNormal:
     """
-    Plot the fitted distribution versus actual data for a specific variable.
+    Fit a `MultivariateNormal` to a subset of ANSUR II measurements, in meters.
+
+    The distribution is fit over the requested measurement columns of the ANSUR II
+    dataset selected by `sex`. The dataset's millimeter values are converted to meters
+    so the distribution matches model-side measurements (which are computed in meters).
 
     Parameters
     ----------
-    mvn: MultivariateNormal
-        The fitted multivariate normal distribution
-    data_df: pandas.DataFrame
-        The original data
-    variable_name: str
-        Name of the variable to plot
-    bins: int, optional
-        Number of histogram bins (default: 30)
+    labels: list[str]
+        ANSUR II measurement names selecting the distribution's variables (columns).
+        Every name must be present in the dataset.
+    sex: str, optional
+        Subject sex ('male' or 'female') selecting the ANSUR II subset. Defaults to None
+        (the combined male-and-female dataset).
+
+    Returns
+    -------
+    MultivariateNormal
+        The fitted distribution over `labels`, in meters.
+
+    Raises
+    ------
+    ValueError
+        If any name in `labels` is not present in the ANSUR II dataset.
     """
-    import matplotlib.pyplot as plt
+    sex_tag = 'BOTH'
+    if sex and sex.lower() == 'male':
+        sex_tag = 'MALE'
+    elif sex and sex.lower() == 'female':
+        sex_tag = 'FEMALE'
+    csv_path = os.path.join(os.path.dirname(__file__), 'resources',
+                            f'ANSUR_II_{sex_tag}_Public.csv')
 
-    # Check if variable exists in the distribution
-    if variable_name not in mvn.variables:
-        raise ValueError(f"Variable '{variable_name}' not found in the distribution")
+    df = pd.read_csv(csv_path, encoding_errors='replace')
+    labels = list(labels)
+    missing = [label for label in labels if label not in df.columns]
+    if missing:
+        raise ValueError(
+            f'Measurement name(s) not present in the ANSUR II dataset: {missing}.')
 
-    # Get index of the variable
-    var_idx = mvn.variables.index(variable_name)
-
-    # Get mean and standard deviation for this variable
-    var_mean = mvn.mean[var_idx]
-    var_std = np.sqrt(mvn.cov[var_idx, var_idx])
-
-    # Create a normal distribution for this variable
-    var_dist = norm(var_mean, var_std)
-
-    # Plot histogram of actual data
-    plt.figure(figsize=(10, 6))
-    print(data_df[variable_name])
-    plt.hist(data_df[variable_name], bins=bins, density=True, alpha=0.6,
-            label='Actual data', color='skyblue')
-
-    # Plot the fitted distribution
-    x = np.linspace(var_mean - 4*var_std, var_mean + 4*var_std, 1000)
-    plt.plot(x, var_dist.pdf(x), 'r-', lw=2, label='Fitted normal distribution')
-
-    plt.title(f'Distribution of {variable_name}')
-    plt.xlabel(variable_name)
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-# Path to your CSV file
-csv_fpath = os.path.join('..', 'osimfit', 'resources', 'ANSUR_II_BOTH_Public.csv')
-
-# Load the CSV file into a DataFrame
-df = pd.read_csv(csv_fpath)
-columns_to_use = ['biacromialbreadth',      # torso width [measure]
-                  'bicristalbreadth',       # pelvis width [draw]
-                  'bimalleolarbreadth',     # tibia width [draw]
-                  'chestdepth',             # torso depth [draw]
-                  'footbreadthhorizontal',  # foot width [measure]
-                  'footlength',             # foot length [measure]
-                  'headbreadth',            # head breadth [draw]
-                  'headlength',             # head length [draw]
-                  'iliocristaleheight',     # foot + tibia + femur + pelvis height [measure]
-                  'lateralmalleolusheight', # foot height [measure]
-                  'radialestylionlength',   # radius length [measure]
-                  'shoulderelbowlength',    # humerus length [measure]
-                  'stature',                # height [measure]
-                  'suprasternaleheight',    # foot + tibia + femur + pelvis + torso height [measure]
-                  'tibialheight',           # foot + tibia height [measure]
-                  'trochanterionheight',    # foot + tibia + femur height [measure]
-                  'waistbacklength',        # torso height [measure]
-                  'waistdepth']             # pelvis depth [draw]
-df = df[columns_to_use]
-mvn = MultivariateNormal.from_data(df.columns.tolist(), df.values)
-
-# Create values dict from mean values
-values = dict()
-for i, var in enumerate(mvn.variables):
-    values[var] = mvn.get_mean()[i]
-
-mvn.get_pdf(values)
-mvn.get_cdf(values)
-
-# import pdb; pdb.set_trace()
-
-
-
-# Example usage:
-plot_variable_distribution(mvn, df, 'biacromialbreadth')
-# plot_variable_distribution(mvn, df, 'bicristalbreadth')
-
-
-# import pdb; pdb.set_trace()
-
-
-
+    data = df[labels].to_numpy(dtype=float) * 1e-3  # mm -> m
+    return MultivariateNormal.from_data(labels, data)

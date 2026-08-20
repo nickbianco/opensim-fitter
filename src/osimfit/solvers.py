@@ -6,8 +6,7 @@ from dataclasses import dataclass
 
 from .bounds import Bounds
 from .data_sources import DataSource, MarkerSource, TheiaFrameSource
-from .costs import Cost, CostInput
-from .callbacks import TrackingCostFunction, BilevelCostFunction
+from .costs import (Cost, CostInput, TrackingCostFunction, BilevelCostFunction)
 from .model import ModelCache, Parameter, BodyScale, MarkerOffset, FrameOffset
 from .scaling import Axis, Scaler, ManualBodyScale
 
@@ -217,6 +216,15 @@ class Solver(ABC):
                 f'requires cost input(s) {sorted(unsupported)} that this solver does '
                 f'not provide (supported: {sorted(self.SUPPORTED_INPUTS)}).')
         self.costs.append(cost)
+
+    def _initialize_costs(self):
+        """
+        Give every registered cost a chance to precompute model-derived data from this
+        solver's `ModelCache`. Called at the start of solve(), after all parameters are
+        registered, so costs need not be constructed with the model or parameters.
+        """
+        for cost in self.costs:
+            cost.initialize(self.mc)
 
     def get_ipopt_options(self, print_level=0):
         """
@@ -449,6 +457,7 @@ class InverseKinematicsSolver(TrackingSolver):
     def solve(self, guess: InverseKinematicsSolution = None
               ) -> InverseKinematicsSolution:
 
+        self._initialize_costs()
         times = self.get_times_from_reference_data()
         num_times = len(times)
 
@@ -638,10 +647,7 @@ class SplinedKinematicsSolver(TrackingSolver):
     def add_parameter(self, parameter: Parameter):
         """
         Register a `Parameter` to be optimized over in the bilevel optimization problem.
-        The parameter is validated against the model at registration time, stored under
-        its `CostInput` field, and its group descriptor is appended to the `ModelCache`
-        for the cost callback to consume. Parameter variable blocks are ordered by
-        `CostInput.INPUT_ORDER`.
+        The parameter is validated against the model at registration time.
 
         Parameters
         ----------
@@ -658,11 +664,7 @@ class SplinedKinematicsSolver(TrackingSolver):
             raise ValueError(
                 f'add_parameter expected a Parameter, but got '
                 f'{type(parameter).__name__}.')
-        if parameter.cost_input not in CostInput.INPUT_ORDER:
-            raise ValueError(
-                f'{type(parameter).__name__} declares cost_input '
-                f'{parameter.cost_input!r}, which is not a recognized CostInput field '
-                f'{CostInput.INPUT_ORDER}.')
+        CostInput.field_index(parameter.cost_input)
         parameter.validate(self.mc)
         self._parameters_by_input.setdefault(parameter.cost_input, []).append(parameter)
         self.mc.add_parameter_group(parameter.to_group())
@@ -741,7 +743,7 @@ class SplinedKinematicsSolver(TrackingSolver):
                         body_name, axis, float(parameter.value[ax_idx])))
         model = scaler.scale()
 
-        # Apply pre-`Model::scale()` quanities./
+        # Apply pre-`Model::scale()` quanities.
         ModelCache.apply_custom_joint_translation_scales(model, translation_scales)
 
         # Apply the remaining optimized parameters (e.g., marker and frame offsets) to
@@ -769,19 +771,11 @@ class SplinedKinematicsSolver(TrackingSolver):
                 f'configured with {len(expected)}.')
 
         # Enforce that the guess lists its parameters grouped in CostInput.INPUT_ORDER.
-        order = CostInput.INPUT_ORDER
-        positions = []
-        for g in got:
-            if g.cost_input not in order:
-                raise ValueError(
-                    f'Initial guess parameter {type(g).__name__} has cost_input '
-                    f'{g.cost_input!r}, which is not a recognized CostInput field '
-                    f'{order}.')
-            positions.append(order.index(g.cost_input))
+        positions = [CostInput.field_index(g.cost_input) for g in got]
         if positions != sorted(positions):
             raise ValueError(
                 f'Initial guess parameters must be ordered by CostInput.INPUT_ORDER '
-                f'{order}, but got {[g.cost_input for g in got]}.')
+                f'{CostInput.INPUT_ORDER}, but got {[g.cost_input for g in got]}.')
 
         for e, g in zip(expected, got):
             if type(g) is not type(e) or g.paths != e.paths:
@@ -799,6 +793,7 @@ class SplinedKinematicsSolver(TrackingSolver):
     def solve(self, guess: SplinedKinematicsSolution = None
               ) -> SplinedKinematicsSolution:
 
+        self._initialize_costs()
         times = self.get_times_from_reference_data()
         num_times = len(times)
 
@@ -957,6 +952,7 @@ class MarkerPlacer(Solver):
 
     def solve(self, guess: MarkerPlacerSolution = None) -> MarkerPlacerSolution:
 
+        self._initialize_costs()
         # Validate the marker source and extract the marker paths to track.
         self.marker_source.validate_marker_paths(self.mc.model)
         positions = self.marker_source.get_positions_table()

@@ -237,6 +237,22 @@ class ModelCache:
                 f"Could not find a Joint in model '{self.model.getName()}' with "
                 f"MobilizedBodyIndex {mobod_index}")
 
+    def cache_body_scale_group_joints(self) -> None:
+        """
+        Populate each registered `BodyScaleGroup`'s `outboard_joints` and
+        `inboard_joints` with the `Joint`s whose mobilizer frames scale with that group:
+        the outboard (X_BM) frame of each group body's joint, and the inboard (X_PF)
+        frame of every joint driving a group body's child.
+        """
+        for group in self.body_scale_groups:
+            group.outboard_joints = [
+                self.get_joint_for_mobilized_body_index(int(k))
+                for k in group.mobod_indexes]
+            group.inboard_joints = [
+                self.get_joint_for_mobilized_body_index(c)
+                for k in group.mobod_indexes
+                for c in self.children_of[int(k)]]
+
     def set_scaled_mobilizer_frame_positions(self, state: osim.State,
                                              body_scales: np.ndarray) -> None:
         """
@@ -391,6 +407,32 @@ class ModelCache:
 
         return Js
 
+    def find_body_scale_group_index(self, mobod_index: int):
+        """
+        Find the `BodyScaleGroup` index associated with a `MobilizedBody` in the model.
+
+        Parameters
+        ----------
+        mobod_index: int
+            The index to a `MobilizedBody` in the model.
+
+        Raises
+        ------
+        Exception
+            If multiple `BodyScaleGroup` indexes are found for the provided
+            `osim.MobilizedBodyIndex`.
+        """
+        scale_groups = list()
+        for g, group in enumerate(self.body_scale_groups):
+            if mobod_index in [int(k) for k in group.mobod_indexes]:
+                scale_groups.append(g)
+
+        if len(scale_groups) > 1:
+            raise Exception(f'Multiple scale groups found for body at index '
+                            f'{mobod_index}')
+
+        return scale_groups[0] if len(scale_groups) > 0 else None
+
     def get_tracking_marker_paths(self):
         """
         Get a list of all markers in the model whose '<fixed>' property is ``False``.
@@ -402,6 +444,132 @@ class ModelCache:
                 tracking_markers.append(marker.getAbsolutePathString())
 
         return tracking_markers
+
+
+class StationCache:
+    """
+    A thin wrapper around a point fixed on a body (a `osim.Station` or a
+    `osim.PhysicalFrame`'s origin) that pre-computes values used repeatedly by solvers
+    and callback functions.
+
+    Construct via `from_station` or `from_frame`.
+
+    Attributes
+    ----------
+    base_frame: osim.PhysicalFrame
+        The base `osim.PhysicalFrame` of the frame to which the point is attached.
+    mobod_index: int
+        The index to the `osim.MobilizedBody` associated with the base frame.
+    base_station: np.ndarray
+        The location of the point in the base frame, shape (3,).
+    body_scale_group_index: None | int
+        The index to the `BodyScaleGroup` associated with this point's
+        `osim.MobilizedBodyIndex`, if it exists.
+    """
+    def __init__(self, *args, **kwargs):
+        raise TypeError(
+            'Construct a StationCache via StationCache.from_station(...) or '
+            'StationCache.from_frame(...).')
+
+    @classmethod
+    def _create(cls, mc: ModelCache, base_frame: osim.PhysicalFrame,
+                base_station: np.ndarray):
+        """
+        Populate a cache from an already-resolved base frame and base-frame point.
+        """
+        cache = cls.__new__(cls)
+        cache.mc = mc
+        cache.base_frame = base_frame
+        cache.mobod_index = int(base_frame.getMobilizedBodyIndex())
+        cache.base_station = base_station
+        cache.body_scale_group_index = mc.find_body_scale_group_index(cache.mobod_index)
+        return cache
+
+    @classmethod
+    def from_station(cls, mc: ModelCache, station: osim.Station):
+        """
+        Build a `StationCache` for an `osim.Station`. `base_station` is the station's
+        location in its base frame.
+
+        Parameters
+        ----------
+        mc: ModelCache
+            A previously-constructed `ModelCache`.
+        station: osim.Station
+            The station (or a subclass, e.g. an `osim.Marker`) to wrap.
+
+        Raises
+        ------
+        ValueError
+            If `station` is not an `osim.Station`.
+        """
+        downcast = osim.Station.safeDownCast(station)
+        if downcast is None:
+            raise ValueError(f'Expected an osim.Station, but got {station}.')
+        base_frame = osim.PhysicalFrame.safeDownCast(
+            downcast.getParentFrame().findBaseFrame())
+        base_station = downcast.findLocationInFrame(mc.state, base_frame).to_numpy()
+        return cls._create(mc, base_frame, base_station)
+
+    @classmethod
+    def from_frame(cls, mc: ModelCache, frame: osim.PhysicalFrame):
+        """
+        Build a `StationCache` for a `osim.PhysicalFrame`'s origin. `base_station` is
+        the frame origin's location in its base frame.
+
+        Parameters
+        ----------
+        mc: ModelCache
+            A previously-constructed `ModelCache`.
+        frame: osim.PhysicalFrame
+            The frame whose origin to wrap.
+
+        Raises
+        ------
+        ValueError
+            If `frame` is not an `osim.PhysicalFrame`.
+        """
+        downcast = osim.PhysicalFrame.safeDownCast(frame)
+        if downcast is None:
+            raise ValueError(f'Expected an osim.PhysicalFrame, but got {frame}.')
+        base_frame = osim.PhysicalFrame.safeDownCast(downcast.findBaseFrame())
+        base_station = downcast.findTransformInBaseFrame().p().to_numpy()
+        return cls._create(mc, base_frame, base_station)
+
+    def calc_scaled_base_station(self, body_scales: np.ndarray) -> np.ndarray:
+        offset = self.base_station.copy()
+        if self.body_scale_group_index is not None:
+            g = self.body_scale_group_index
+            offset = offset * np.asarray(body_scales[3*g : 3*g+3], dtype=float)
+        return offset
+
+    def calc_position(self, state: osim.State, body_scales: np.ndarray) -> osim.Vec3:
+        offset = self.calc_scaled_base_station(body_scales)
+        vec = osim.Vec3(float(offset[0]), float(offset[1]), float(offset[2]))
+        return self.base_frame.findStationLocationInGround(state, vec)
+
+    def calc_position_jacobian_wrt_body_scales(self, state: osim.State) -> np.ndarray:
+        rotation = self.base_frame.getRotationInGround(state)
+        R_GB = np.array([[rotation.get(r, c) for c in range(3)] for r in range(3)])
+        jacobian = np.zeros((3, 3 * len(self.mc.body_scale_groups)))
+        for axis in range(3):
+            dp_GB = osim.VectorVec3(self.mc.num_mobod, osim.Vec3(0))
+            unit = [0.0, 0.0, 0.0]
+            unit[axis] = 1.0
+            dp_GB.set(self.mobod_index, osim.Vec3(unit[0], unit[1], unit[2]))
+            row = self.mc.calc_position_jacobian_wrt_body_scales(
+                state, dp_GB)[0, :].copy()
+
+            # Add the contribution from scaling the station's base-frame location.
+            if self.body_scale_group_index is not None:
+                doffset = np.asarray(unit) @ R_GB
+                g = self.body_scale_group_index
+                row[3*g:3*g+3] += self.base_station * doffset
+
+            jacobian[axis, :] = row
+
+        return jacobian
+
 
 ##############
 # PARAMETERS #
