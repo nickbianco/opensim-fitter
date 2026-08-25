@@ -1,24 +1,21 @@
-"""Sandbox: plugging a statistical shape model into opensim-fitter's bilevel
-machinery -- a small, self-contained worked example, deliberately decoupled from the
-real code so it can be read start to finish without jumping into osimfit.
+"""Sandbox: plugging a statistical shape model into opensim-fitter's NLP the
+same way a body scale already does -- a small parameter vector `s` in,
+morphed geometry out, through a CasADi callback with an analytic Jacobian.
 
-The real integration (see SHAPE_MODEL.md) has two layers on top of what's here:
+`ShapeModel` is the interface a shape model needs to implement:
+`n_params`/`nominal`/`bounds` describe `s`, `apply(s)` morphs the geometry,
+`geometry_jacobian(s)` is its exact derivative, and `prior(s)` regularizes
+implausible `s`. `FemurHeadLandmarkShapeModel` is a real implementation, built
+from a real 536-subject femur+hip PCA: it picks one femoral-head landmark
+vertex and moves it along the PCA modes -- exactly linear in `s`, so
+`geometry_jacobian(s)` is just a constant matrix.
 
-1. `osimfit.model.ShapeModel` is the same math contract as the `ShapeModel` below,
-   plus the glue that makes it a bilevel `Parameter`: `expand()` (fold `s` into a
-   marker/frame offset), `to_groups()`, `prior_expr()`, and per-path
-   `validate()`/`apply_to_model()` via `MarkerTargetMixin`/`FrameTargetMixin`. None of
-   that lives here -- this file only implements the math, not the wiring.
-2. `osimfit.callbacks.ShapeModelCallback` is the class below, promoted essentially
-   unchanged.
-
-`n_params`/`nominal`/`bounds` describe the shape factor `s`, `apply(s)` morphs
-geometry, `geometry_jacobian(s)` is its exact derivative, and `prior(s)` regularizes
-implausible `s`. `FemurHeadLandmarkShapeModel` is a real implementation, built from a
-real 536-subject femur+hip PCA: it picks one vertex on the femoral head and moves it
-along the PCA modes. That's the simplest possible linear shape model -- exactly the
-shape `osimfit.model.ShapeModel.expand()` requires (a constant `geometry_jacobian`),
-and the shape every real PCA-based SSM has.
+`ShapeModelCallback` wraps any `ShapeModel` as a CasADi `Callback`, the same
+way `PositionCallback`/`PositionCallback_Jac` in sandbox_jacobians.py wrap a
+generalized coordinate `q` -- needed because `apply`/`geometry_jacobian`
+call real NumPy linear algebra CasADi can't see inside of. `prior(s)`
+doesn't need that: it's plain arithmetic, so CasADi differentiates it
+directly when `fit_shape_factor` calls it on a symbolic `s`.
 """
 
 import csv
@@ -144,13 +141,6 @@ class ShapeModelCallback(ca.Callback):
     apply/geometry_jacobian call real NumPy linear algebra CasADi can't see
     inside of -- unlike prior(s), which is plain arithmetic and gets called
     directly on the symbolic s with no Callback at all.
-
-    In the real code (osimfit.callbacks.ShapeModelCallback, promoted from here
-    essentially unchanged), ShapeModel.expand() -- the bilevel-Parameter fast path --
-    doesn't use this: a linear shape model's Jacobian is constant, so expand() caches
-    geometry_jacobian(nominal) once as a plain matrix instead of wrapping a Callback.
-    This class is still needed wherever geometry_jacobian must be re-evaluated at a
-    changing s, e.g. fit_shape_factor below.
     """
 
     def __init__(self, name, shape_model, output_size, opts={}):
