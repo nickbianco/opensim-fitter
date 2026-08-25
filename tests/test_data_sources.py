@@ -4,7 +4,7 @@ Unit tests for src/osimfit/data_sources.py.
 
 import pytest
 import opensim as osim
-from osimfit.data_sources import DataSource, MarkerSource
+from osimfit.data_sources import DataSource, MarkerSource, Trial
 
 
 ###########
@@ -37,24 +37,59 @@ def create_Quaternion_table(times, labels):
 
 class PositionsSource(DataSource):
     """
-    Throwaway subclass that provides positions only.
+    Test subclass that provides positions only.
     """
+    def __init__(self):
+        super().__init__('positions')
+
+    def _provides_positions(self):
+        return True
+
+    def _provides_orientations(self):
+        return False
+
     def _create_positions_table(self):
         return create_Vec3_table([0.0, 0.1], ['a', 'b'])
+
+    def _create_orientations_table(self):
+        raise NotImplementedError(
+            f"PositionsSource does not provide orientation data.")
 
 
 class OrientationsSource(DataSource):
     """
-    Throwaway subclass that provides orientations only.
+    Test subclass that provides orientations only.
     """
+    def __init__(self):
+        super().__init__('orientations')
+
+    def _provides_positions(self):
+        return False
+
+    def _provides_orientations(self):
+        return True
+
+    def _create_positions_table(self):
+        raise NotImplementedError(
+            f"OrientationsSource does not provide position data.")
+
     def _create_orientations_table(self):
         return create_Quaternion_table([0.0, 0.1], ['a', 'b'])
 
 
 class PositionsAndOrientationsSource(DataSource):
     """
-    Throwaway subclass that provides both positions and orientations.
+    Test subclass that provides both positions and orientations.
     """
+    def __init__(self):
+        super().__init__('positions_and_orientations')
+
+    def _provides_positions(self):
+        return True
+
+    def _provides_orientations(self):
+        return True
+
     def _create_positions_table(self):
         return create_Vec3_table([0.0, 0.1], ['a', 'b'])
 
@@ -64,9 +99,24 @@ class PositionsAndOrientationsSource(DataSource):
 
 class NoSource(DataSource):
     """
-    Throwaway subclass that provides neither positions nor orientations.
+    Test subclass that provides neither positions nor orientations.
     """
-    pass
+    def __init__(self, trim_to_range=None):
+        super().__init__('none', trim_to_range=trim_to_range)
+
+    def _provides_positions(self):
+        return False
+
+    def _provides_orientations(self):
+        return False
+
+    def _create_positions_table(self):
+        raise NotImplementedError(
+            f"NoSource does not provide position data.")
+
+    def _create_orientations_table(self):
+        raise NotImplementedError(
+            f"NoSource does not provide orientation data.")
 
 
 #########################
@@ -75,32 +125,32 @@ class NoSource(DataSource):
 
 def test_provides_positions_only():
     src = PositionsSource()
-    assert src.provides_positions is True
-    assert src.provides_orientations is False
+    assert src.provides_positions() is True
+    assert src.provides_orientations() is False
 
 
 def test_provides_orientations_only():
     src = OrientationsSource()
-    assert src.provides_positions is False
-    assert src.provides_orientations is True
+    assert src.provides_positions() is False
+    assert src.provides_orientations() is True
 
 
 def test_provides_positions_and_orientations():
     src = PositionsAndOrientationsSource()
-    assert src.provides_positions is True
-    assert src.provides_orientations is True
+    assert src.provides_positions() is True
+    assert src.provides_orientations() is True
 
 
 def test_no_source_provided():
     src = NoSource()
-    assert src.provides_positions is False
-    assert src.provides_orientations is False
+    assert src.provides_positions() is False
+    assert src.provides_orientations() is False
 
 
 def test_marker_source_provides_positions_only():
-    src = MarkerSource('nonexistent.trc')
-    assert src.provides_positions is True
-    assert src.provides_orientations is False
+    src = MarkerSource('nonexistent', 'nonexistent.trc')
+    assert src.provides_positions() is True
+    assert src.provides_orientations() is False
 
 
 def test_get_positions_raises_with_subclass_name_when_not_provided():
@@ -225,3 +275,45 @@ def test_assert_sources_share_times_raises_when_source_hasNoSource():
     sources = [PositionsSource(), NoSource()]
     with pytest.raises(ValueError, match='NoSource'):
         DataSource.assert_sources_share_times(sources)
+
+
+#########
+# TRIAL #
+#########
+
+class StubMarkerSource(MarkerSource):
+    """
+    A MarkerSource that returns a synthetic positions table rather than reading a TRC,
+    so Trial's type dispatch can be exercised without a file on disk.
+    """
+    def __init__(self, name: str, sample_times: list[float], labels=('a', 'b')):
+        super().__init__(name, 'unused.trc')
+        self.sample_times = sample_times
+        self.labels = list(labels)
+
+    def _create_positions_table(self):
+        return create_Vec3_table(self.sample_times, self.labels)
+
+
+def test_trial_rejects_empty_name():
+    with pytest.raises(ValueError, match='non-empty string'):
+        Trial('')
+
+
+def test_trial_adopts_shared_times_from_its_sources():
+    trial = Trial('trial', [StubMarkerSource('stub1', [0.0, 0.1, 0.2]),
+                            StubMarkerSource('stub2', [0.0, 0.1, 0.2], labels=('c',))])
+    assert len(trial.marker_data) == 2
+    assert trial.times == [0.0, 0.1, 0.2]
+    assert trial.num_times == 3
+
+
+def test_trial_rejects_source_with_mismatched_times():
+    trial = Trial('trial', [StubMarkerSource('stub1', [0.0, 0.1])])
+    with pytest.raises(ValueError, match='same times'):
+        trial.add_data_source(StubMarkerSource('stub2', [0.0, 0.2]))
+
+
+def test_trial_times_raises_without_reference_data():
+    with pytest.raises(ValueError, match='no reference data'):
+        Trial('trial').times

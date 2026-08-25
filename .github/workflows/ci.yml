@@ -36,7 +36,7 @@ jobs:
       - name: Install Python runtime dependencies
         run: pip install -r dependencies/requirements.txt
 
-      - name: Build and install OpenSim from source
+      - name: Build and install OpenSim
         working-directory: dependencies
         run: |
           python -c "import sys, yaml; yaml.safe_dump({'python_root_dir': sys.prefix}, open('config.yaml','w'))"
@@ -72,7 +72,7 @@ jobs:
       - name: Install Python runtime dependencies
         run: pip install -r dependencies/requirements.txt
 
-      - name: Build and install OpenSim from source
+      - name: Build and install OpenSim
         working-directory: dependencies
         run: |
           python -c "import sys, yaml; yaml.safe_dump({'python_root_dir': sys.prefix}, open('config.yaml','w'))"
@@ -91,6 +91,7 @@ jobs:
     runs-on: windows-latest
     env:
       OPENSIM_BUILD_JOBS: 6
+
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
@@ -108,7 +109,7 @@ jobs:
       - name: Install Python runtime dependencies
         run: pip install -r dependencies/requirements.txt
 
-      - name: Build and install OpenSim from source
+      - name: Build and install OpenSim
         working-directory: dependencies
         run: |
           python -c "import sys, yaml; yaml.safe_dump({'python_root_dir': sys.prefix}, open('config.yaml','w'))"

@@ -1,7 +1,8 @@
 import ezc3d
 import numpy as np
 import opensim as osim
-from abc import ABC
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 
 class DataSource(ABC):
@@ -38,8 +39,10 @@ class DataSource(ABC):
         the original time vector.
     """
 
-    def __init__(self, labels_to_remove=None, label_map=None, trim_to_range=None):
+    def __init__(self, name: str, labels_to_remove: list[str] = None,
+                 label_map: dict[str, str] = None, trim_to_range: tuple = None):
         super().__init__()
+        self.name = name
         self.labels_to_remove = labels_to_remove
         self.label_map = label_map
 
@@ -54,15 +57,6 @@ class DataSource(ABC):
                     f"{trim_to_range[0]}, respectively.")
         self.trim_to_range = trim_to_range
 
-    @property
-    def provides_positions(self) -> bool:
-        return (type(self)._create_positions_table
-                is not DataSource._create_positions_table)
-
-    @property
-    def provides_orientations(self) -> bool:
-        return (type(self)._create_orientations_table
-                is not DataSource._create_orientations_table)
 
     def get_positions_table(self) -> osim.TimeSeriesTableVec3:
         """
@@ -116,13 +110,27 @@ class DataSource(ABC):
             self.trim_table_to_range(table, self.trim_to_range)
         return table
 
-    def _create_positions_table(self) -> osim.TimeSeriesTableVec3:
-        raise NotImplementedError(
-            f"{type(self).__name__} does not provide position data.")
+    def provides_positions(self) -> bool:
+        return self._provides_positions()
 
+    def provides_orientations(self) -> bool:
+        return self._provides_orientations()
+
+    @abstractmethod
+    def _provides_positions(self) -> bool:
+        pass
+
+    @abstractmethod
+    def _provides_orientations(self) -> bool:
+        pass
+
+    @abstractmethod
+    def _create_positions_table(self) -> osim.TimeSeriesTableVec3:
+        pass
+
+    @abstractmethod
     def _create_orientations_table(self) -> osim.TimeSeriesTableQuaternion:
-        raise NotImplementedError(
-            f"{type(self).__name__} does not provide orientation data.")
+        pass
 
     @staticmethod
     def assert_position_orientation_consistent(positions, orientations):
@@ -260,9 +268,9 @@ class DataSource(ABC):
         """
         tables = []
         for source in sources:
-            if source.provides_positions:
+            if source.provides_positions():
                 tables.append(source.get_positions_table())
-            elif source.provides_orientations:
+            elif source.provides_orientations():
                 tables.append(source.get_orientations_table())
             else:
                 raise ValueError(
@@ -324,11 +332,17 @@ class MarkerSource(DataSource):
         See :py:class:`DataSource`.
     """
 
-    def __init__(self, trc_filepath, labels_to_remove=None, label_map=None,
+    def __init__(self, name: str, trc_filepath, labels_to_remove=None, label_map=None,
                  trim_to_range=None):
-        super().__init__(labels_to_remove=labels_to_remove, label_map=label_map,
+        super().__init__(name, labels_to_remove=labels_to_remove, label_map=label_map,
                          trim_to_range=trim_to_range)
         self.trc_filepath = trc_filepath
+
+    def _provides_positions(self):
+        return True
+
+    def _provides_orientations(self):
+        return False
 
     def _create_positions_table(self) -> osim.TimeSeriesTableVec3:
         table = osim.TimeSeriesTableVec3(self.trc_filepath)
@@ -340,6 +354,10 @@ class MarkerSource(DataSource):
             table.addTableMetaDataString("Units", "m")
 
         return table
+
+    def _create_orientations_table(self) -> osim.TimeSeriesTableQuaternion:
+        raise NotImplementedError(
+            f"MarkerSource does not provide orientation data.")
 
     def validate_marker_paths(self, model: osim.Model):
         """
@@ -404,9 +422,9 @@ class TheiaFrameSource(DataSource):
         See :py:class:`DataSource`.
     """
 
-    def __init__(self, c3d_filepath, labels_to_remove=None, label_map=None,
+    def __init__(self, name: str, c3d_filepath, labels_to_remove=None, label_map=None,
                  trim_to_range=None):
-        super().__init__(labels_to_remove=labels_to_remove, label_map=label_map,
+        super().__init__(name, labels_to_remove=labels_to_remove, label_map=label_map,
                          trim_to_range=trim_to_range)
 
         self.filepath = c3d_filepath
@@ -437,6 +455,11 @@ class TheiaFrameSource(DataSource):
         self.num_frames = self.data.shape[3]
         self.times = np.array([i/self.rate for i in range(self.num_frames)])
 
+    def _provides_positions(self):
+            return True
+
+    def _provides_orientations(self):
+        return True
 
     def _create_positions_table(self) -> osim.TimeSeriesTableVec3:
         table = osim.TimeSeriesTableVec3()
@@ -454,7 +477,6 @@ class TheiaFrameSource(DataSource):
         table.addTableMetaDataString("DataRate", str(self.rate))
 
         return table
-
 
     def _create_orientations_table(self) -> osim.TimeSeriesTableQuaternion:
         table = osim.TimeSeriesTableQuaternion()
@@ -489,3 +511,158 @@ class TheiaFrameSource(DataSource):
         table.addTableMetaDataString("DataRate", str(self.rate))
 
         return table
+
+
+################
+# DATA STRUCTS #
+################
+
+@dataclass
+class FrameData:
+    labels: list[str]
+    positions: osim.TimeSeriesTableVec3
+    orientations: osim.TimeSeriesTableQuaternion
+
+
+@dataclass
+class MarkerData:
+    labels: list[str]
+    positions: osim.TimeSeriesTableVec3
+
+
+#########
+# TRIAL #
+#########
+
+class Trial:
+    """
+    All reference data representing a single motion.
+
+    A `Trial` object bundles the `DataSource` objects recorded together for one motion.
+    Each source's table is built once, when the source is added, and stored. All sources
+    within a trial must share the same time vector, since solvers index them by a common
+    per-trial time index.
+
+    Parameters
+    ----------
+    name: str
+        A non-empty identifier for this trial, unique among the trials registered with a
+        solver.
+    data_sources: list[DataSource], optional
+        Data sources to add, dispatched by type (see `add_source`). Sources can also be
+        added after construction.
+
+    Attributes
+    ----------
+    marker_data: list[MarkerData]
+        The list of all registered position data from data sources (e.g.,
+        `MarkerSource`).
+    frame_data: list[FrameData]
+        The list of all registered position and orientation from data sources (e.g.,
+        `TheiaFrameSource`).
+    data_sources: dict[str, DataSource]
+        A dictionary containing the original added `DataSource`s, keyed by the
+        data source names.
+    """
+
+    def __init__(self, name: str, data_sources: list[DataSource] = None):
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f'Expected a non-empty string for the trial name, but got {name!r}.')
+        self.name = name
+        self.marker_data: list[MarkerData] = []
+        self.frame_data: list[FrameData] = []
+        self._times: list[float] = None
+        self.data_sources: dict[str, DataSource] = {}
+        for source in data_sources or []:
+            self.add_data_source(source)
+
+    def add_data_source(self, data_source: DataSource):
+        """
+        Add a `DataSource` to this trial.
+
+        Raises
+        ------
+        ValueError
+            If `data_source` is not a supported `DataSource` type or if a `DataSource`
+            with the same already exists in the trial.
+        """
+        if data_source.name in self.data_sources:
+            raise ValueError(f'A DataSource with name {data_source.name} already '
+                             f'exists in this trial.')
+        self.data_sources[data_source.name] = data_source
+
+        if data_source.provides_positions() and not data_source.provides_orientations():
+            positions = data_source.get_positions_table()
+            labels = positions.getColumnLabels()
+            self._register_times(positions)
+            self.marker_data.append(MarkerData(labels, positions))
+        elif data_source.provides_positions() and data_source.provides_orientations():
+            positions = data_source.get_positions_table()
+            orientations = data_source.get_orientations_table()
+            DataSource.assert_position_orientation_consistent(positions, orientations)
+            labels = positions.getColumnLabels()
+            self._register_times(positions)
+            self.frame_data.append(FrameData(labels, positions, orientations))
+        else:
+            raise ValueError(
+                f'Cannot add a {type(data_source).__name__} to the trial.')
+
+    def get_data_source(self, name: str) -> DataSource:
+        """
+        Get the `DataSource` from this trial matching the provided name.
+
+        Raises
+        ------
+        ValueError
+            If no `DataSource` matching `name` exists in this the trial.
+        """
+        if name not in self.data_sources:
+            raise ValueError(
+                f"No DataSource with name '{name}' found in this trial.")
+
+        return self.data_sources[name]
+
+    def _register_times(self, table):
+        """
+        Adopt `table`'s independent column as this trial's time vector, or assert that
+        it matches the one already adopted from a previously added source.
+
+        Raises
+        ------
+        ValueError
+            If `table`'s time column differs from this trial's.
+        """
+        times = list(table.getIndependentColumn())
+        if self._times is None:
+            self._times = times
+        elif not np.array_equal(np.asarray(self._times), np.asarray(times)):
+            raise ValueError(
+                f"Cannot add a data source to trial '{self.name}': its time vector "
+                f"differs from that of the trial's existing data sources. All data "
+                f"sources within a trial must be sampled at the same times, since "
+                f"solvers index them by a common time index; data from a separate "
+                f"motion belongs in its own Trial.")
+
+    @property
+    def times(self) -> list[float]:
+        """
+        The trial's time vector, shared by all of its data sources.
+
+        Raises
+        ------
+        ValueError
+            If the trial has no data sources.
+        """
+        if self._times is None:
+            raise ValueError(
+                f"Trial '{self.name}' has no reference data; add a data source before "
+                f"querying its time vector.")
+        return self._times
+
+    @property
+    def num_times(self) -> int:
+        """
+        The number of time samples in this trial's reference data.
+        """
+        return len(self.times)

@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar
 
+from .data_sources import Trial
 from .model import ModelCache, StationCache
 from .scaling import AnthropometricMeasurement
 from .anthropometrics import build_ansur_distribution
@@ -106,11 +107,24 @@ class CostInput:
         return ca.reshape(value, 3, num_entries // 3).T
 
 
-class Cost(ABC):
+class CostRep(ABC):
     """
-    A uniform interface for the cost terms of an optimization problem. A cost is
-    evaluated by calling it with a `CostInput` that bundles the canonical optimization
-    variables; a cost reads only the fields it depends on.
+    A cost's per-solve representation that a solver evaluates.
+
+    A `CostRep` is constructed via a cost's `create_rep` from the solver's `ModelCache`
+    and lives only for the duration of one solve.
+    """
+
+    @abstractmethod
+    def __call__(self, input: CostInput) -> ca.MX:
+        pass
+
+
+class CostBase(ABC):
+    """
+    A model-independent description of a cost term: the weights, targets, and reference
+    data the user (or a solver) supplies, with no OpenSim state of its own. A cost is
+    inert and reusable. All model-bound work happens in the `CostRep` it creates.
 
     Attributes
     ----------
@@ -121,27 +135,89 @@ class Cost(ABC):
     """
     required_inputs: frozenset[str] = frozenset()
 
-    def initialize(self, model_cache: ModelCache) -> None:
-        """
-        Precompute any model-derived data the cost needs, given the solver's
-        `ModelCache`. The solver calls this once for every registered cost before
-        building the objective, so users need not pass the model (or body-scale
-        parameters) when constructing a cost. The default is a no-op; costs that depend
-        on the model (e.g., `AnthropometricRegularizationCost`) override it.
-        """
+
+class Cost(CostBase):
+    """
+    A cost whose rep is built from the `ModelCache` alone, and so the kind of cost a
+    user can register on a solver via `Solver.add_cost`.
+    """
 
     @abstractmethod
-    def __call__(self, input: CostInput) -> ca.MX:
-        pass
+    def create_rep(self, mc: ModelCache) -> CostRep:
+        """
+        Build one of this cost's representations against `mc`. Solvers call this once
+        for every rep the problem needs, after all parameter groups are registered, and
+        hold the returned reps for the lifetime of the solve.
+
+        Parameters
+        ----------
+        mc: ModelCache
+            The solver's `ModelCache`, from which the rep initializes any model-derived
+            quantities.
+        """
+
+
+class TrackingCostBase(CostBase):
+    """
+    A cost evaluated at a single time sample of a single trial, whose rep therefore
+    needs that trial and sample index at construction.
+    """
+
+    @abstractmethod
+    def create_rep(self, name: str, mc: ModelCache, trial: Trial,
+                   itime: int) -> CostRep:
+        """
+        Build this cost's representation of one time sample of one trial. Solvers call
+        this once for every sample the problem tracks, after all parameter groups are
+        registered, and hold the returned reps for the lifetime of the solve.
+
+        Parameters
+        ----------
+        name: str
+            The name of the rep's callback function.
+        mc: ModelCache
+            The solver's `ModelCache`, from which the rep initializes any model-derived
+            quantities.
+        trial: Trial
+            The trial supplying the reference data.
+        itime: int
+            Index of the time sample within `trial` that the rep tracks.
+        """
 
 
 class SymbolicCost(Cost):
     """
-    A `Cost` defined directly as a CasADi expression, requiring no OpenSim evaluation
-    (e.g., a regularization penalty on the optimization variables). Unlike
-    `CallbackCost`, it is differentiated symbolically by CasADi and incurs no callback
-    overhead.
+    A `Cost` whose rep is a plain CasADi expression, requiring no OpenSim evaluation.
+    It is differentiated symbolically by CasADi and incurs no callback overhead.
     """
+
+    @abstractmethod
+    def evaluate(self, input: CostInput) -> ca.MX:
+        """
+        Return this cost's CasADi expression for `input`.
+        """
+
+    def create_rep(self, mc: ModelCache) -> 'SymbolicCostRep':
+        return SymbolicCostRep(self)
+
+
+class SymbolicCostRep(CostRep):
+    """
+    The rep of a `SymbolicCost`. It holds no model-derived state, since the cost is a
+    pure expression over the optimization variables, and simply defers to
+    `SymbolicCost.evaluate`.
+
+    Parameters
+    ----------
+    cost: SymbolicCost
+        The cost this rep represents.
+    """
+
+    def __init__(self, cost: SymbolicCost):
+        self.cost = cost
+
+    def __call__(self, input: CostInput) -> ca.MX:
+        return self.cost.evaluate(input)
 
 
 class Function(ca.Callback, ABC):
@@ -247,11 +323,12 @@ class Function(ca.Callback, ABC):
         pass
 
 
-class CallbackCost(Cost, Function):
+class CallbackCostRep(CostRep, Function):
     """
-    A `Cost` function backed by a CasADi callback function.
+    A `CostRep` backed by a CasADi callback function that evaluates the cost and its
+    Jacobian through OpenSim. Constructed with a fully-populated `ModelCache`, so the
+    input sizes it declares to CasADi match the solver's registered parameter groups.
     """
-    required_inputs = frozenset({'coordinates'})
 
     def __call__(self, input: CostInput) -> ca.MX:
         return ca.Function.__call__(
@@ -307,7 +384,7 @@ class BodyScaleRegularizationCost(SymbolicCost):
         self.weight = weight
         self.target = target
 
-    def __call__(self, input: CostInput) -> ca.MX:
+    def evaluate(self, input: CostInput) -> ca.MX:
         return self.weight * ca.sum((input.body_scales - self.target)**2)
 
 
@@ -335,7 +412,7 @@ class BodyScaleIsotropyCost(SymbolicCost):
                 f'Expected weight to be non-negative, but got {weight}.')
         self.weight = weight
 
-    def __call__(self, input: CostInput) -> ca.MX:
+    def evaluate(self, input: CostInput) -> ca.MX:
         scales = input.as_triplets('body_scales')
         axis_means = ca.sum2(scales) / 3
         deviations = scales - ca.repmat(axis_means, 1, 3)
@@ -362,7 +439,7 @@ class OffsetRegularizationCost(SymbolicCost):
                 f'Expected weight to be non-negative, but got {weight}.')
         self.weight = weight
 
-    def __call__(self, input: CostInput) -> ca.MX:
+    def evaluate(self, input: CostInput) -> ca.MX:
         offsets = ca.vertcat(input.marker_offsets, input.frame_offsets)
         return self.weight * ca.sum(offsets**2)
 
@@ -897,10 +974,53 @@ class FrameBilevelTerm(FrameTasks, BilevelTerm):
 # COST FUNCTIONS #
 ##################
 
-class TrackingCostFunction(CallbackCost):
+class TrackingCost(TrackingCostBase):
     """
-    A callback cost function that evaluates the sum of tracking cost terms over a set of
-    model frames and markers with respect to the model's generalized coordinates.
+    The weighted, squared error between the model's markers and frames and a trial's
+    reference data, as a function of the model's generalized coordinates.
+
+    Parameters
+    ----------
+    position_weight: float, optional
+        Weight applied to marker and frame-origin position errors. Default is 1.0.
+    orientation_weight: float, optional
+        Weight applied to frame orientation errors. Default is 1.0.
+    """
+    required_inputs = frozenset({'coordinates'})
+
+    def __init__(self, position_weight: float = 1.0,
+                 orientation_weight: float = 1.0):
+        self.position_weight = position_weight
+        self.orientation_weight = orientation_weight
+
+    def create_rep(self, name: str, mc: ModelCache, trial: Trial,
+                   itime: int) -> 'TrackingCostRep':
+        rep = TrackingCostRep(name, mc)
+
+        for data in trial.frame_data:
+            for iframe, frame_path in enumerate(data.labels):
+                rep.add_frame_tracking_cost_term(
+                    frame_path,
+                    data.positions.getRowAtIndex(itime).getElt(0, iframe),
+                    data.orientations.getRowAtIndex(itime).getElt(0, iframe),
+                    position_weight=self.position_weight,
+                    orientation_weight=self.orientation_weight)
+
+        for data in trial.marker_data:
+            for imarker, marker_path in enumerate(data.labels):
+                rep.add_marker_tracking_cost_term(
+                    marker_path,
+                    data.positions.getRowAtIndex(itime).getElt(0, imarker),
+                    weight=self.position_weight)
+
+        return rep
+
+
+class TrackingCostRep(CallbackCostRep):
+    """
+    The rep of a `TrackingCost`: a callback that evaluates the sum of tracking cost
+    terms over a set of model frames and markers with respect to the model's
+    generalized coordinates.
 
     Parameters
     ----------
@@ -955,11 +1075,63 @@ class TrackingCostFunction(CallbackCost):
         return [J, empty, empty, empty]
 
 
-class BilevelCostFunction(CallbackCost):
+class BilevelCost(TrackingCostBase):
     """
-    A callback cost function that evaluates the sum of tracking cost terms over a set of
-    model markers and frames with respect to the model's generalized coordinates, a set
-    of body scales, and a set of per-marker/frame XYZ placement offsets.
+    The tracking cost of `TrackingCost`, as a function of the model's generalized
+    coordinates, its body scales, and its per-marker/frame XYZ placement offsets.
+
+    Parameters
+    ----------
+    position_weight: float, optional
+        Weight applied to marker and frame-origin position errors. Default is 1.0.
+    orientation_weight: float, optional
+        Weight applied to frame orientation errors. Default is 1.0.
+    """
+    required_inputs = frozenset(
+        {'coordinates', 'body_scales', 'marker_offsets', 'frame_offsets'})
+
+    def __init__(self, position_weight: float = 1.0,
+                 orientation_weight: float = 1.0):
+        self.position_weight = position_weight
+        self.orientation_weight = orientation_weight
+
+    def create_rep(self, name: str, mc: ModelCache, trial: Trial,
+                   itime: int) -> 'BilevelCostRep':
+        rep = BilevelCostRep(name, mc)
+        # Map each offset target path to the index of the offset group that applies to
+        # it; paths absent from a mapping are not offset.
+        marker_index_of = {path: i for i, grp in enumerate(mc.marker_offset_groups)
+                           for path in grp.component_paths}
+        frame_index_of = {path: i for i, grp in enumerate(mc.frame_offset_groups)
+                          for path in grp.component_paths}
+
+        for data in trial.frame_data:
+            for iframe, frame_path in enumerate(data.labels):
+                rep.add_frame_bilevel_cost_term(
+                    frame_path,
+                    data.positions.getRowAtIndex(itime).getElt(0, iframe),
+                    data.orientations.getRowAtIndex(itime).getElt(0, iframe),
+                    position_weight=self.position_weight,
+                    orientation_weight=self.orientation_weight,
+                    offset_group_index=frame_index_of.get(frame_path))
+
+        for data in trial.marker_data:
+            for imarker, marker_path in enumerate(data.labels):
+                rep.add_marker_bilevel_cost_term(
+                    marker_path,
+                    data.positions.getRowAtIndex(itime).getElt(0, imarker),
+                    weight=self.position_weight,
+                    offset_group_index=marker_index_of.get(marker_path))
+
+        return rep
+
+
+class BilevelCostRep(CallbackCostRep):
+    """
+    The rep of a `BilevelCost`: a callback that evaluates the sum of tracking cost
+    terms over a set of model markers and frames with respect to the model's generalized
+    coordinates, a set of body scales, and a set of per-marker/frame XYZ placement
+    offsets.
 
     Parameters
     ----------
@@ -973,8 +1145,6 @@ class BilevelCostFunction(CallbackCost):
         If ``True``, CasADi finite-differences the callback instead of using its analytic
         Jacobian. Default is ``False``.
     """
-    required_inputs = frozenset(
-        {'coordinates', 'body_scales', 'marker_offsets', 'frame_offsets'})
 
     def __init__(self, name: str, mc: ModelCache, enable_fd: bool = False):
         Function.__init__(self, name, mc, enable_fd=enable_fd)
@@ -1031,7 +1201,7 @@ class BilevelCostFunction(CallbackCost):
         return [Jq_m + Jq_f, Js_m + Js_f, Jmo, Jfo]
 
 
-class AnthropometricRegularizationCost(CallbackCost):
+class AnthropometricRegularizationCost(Cost):
     """
     A regularization penalty on body-scale factors, ``s``, that maximizes the
     log-likelihood that a set of anthropometric measurements, ``m(s)``, fall within a
@@ -1065,27 +1235,23 @@ class AnthropometricRegularizationCost(CallbackCost):
         (the combined male-and-female dataset).
     weight: float, optional
         Non-negative scalar applied to the penalty. Default is 1.0.
-    enable_fd: bool, optional
-        If ``True``, CasADi finite-differences the cost through OpenSim rather than
-        using the analytic Jacobian. Default is ``False``.
 
     Raises
     ------
     ValueError
         If `weight` is negative or a measurement name is not present in the ANSUR II
-        dataset. `initialize` additionally validates that the referenced components are
-        stations.
+        dataset. `AnthropometricRegularizationCostRep` additionally validates that the
+        referenced components are stations.
     """
     required_inputs = frozenset({'body_scales'})
 
     def __init__(self, measurements: list[AnthropometricMeasurement],
-                 sex: str = None, weight: float = 1.0, enable_fd: bool = False):
+                 sex: str = None, weight: float = 1.0):
         if weight < 0:
             raise ValueError(
                 f'Expected weight to be non-negative, but got {weight}.')
         self.weight = weight
         self.measurements = measurements
-        self.enable_fd = enable_fd
 
         # Fit the ANSUR II distribution over the requested measurements, in meters.
         measurement_names = [m.name for m in self.measurements]
@@ -1094,16 +1260,41 @@ class AnthropometricRegularizationCost(CallbackCost):
         self.precision = np.linalg.inv(
             np.asarray(distribution.get_covariance(), dtype=float))
 
-        # Populated by initialize(), which the solver calls before evaluation.
-        self.default_q: np.ndarray | None = None
-        self.station_caches: list | None = None
+    def create_rep(self, mc: ModelCache) -> 'AnthropometricRegularizationCostRep':
+        return AnthropometricRegularizationCostRep(self, mc)
 
-    def initialize(self, mc: ModelCache) -> None:
+
+class AnthropometricRegularizationCostRep(CallbackCostRep):
+    """
+    The rep of an `AnthropometricRegularizationCost`. It caches the model's default
+    pose and a `StationCache` pair per measurement, then evaluates the Mahalanobis
+    penalty and its gradient through OpenSim.
+
+    Parameters
+    ----------
+    cost: AnthropometricRegularizationCost
+        The cost this rep represents.
+    mc: ModelCache
+        The solver's `ModelCache`, whose registered body scale groups set this
+        callback's input size.
+    enable_fd: bool, optional
+        If ``True``, CasADi finite-differences the callback rather than using its
+        analytic Jacobian. Default is ``False``.
+
+    Raises
+    ------
+    ValueError
+        If a measurement references a component that is not an `osim.Station`.
+    """
+
+    def __init__(self, cost: AnthropometricRegularizationCost, mc: ModelCache,
+                 enable_fd: bool = False):
+        self.cost = cost
         mc.model.realizePosition(mc.state)
         self.default_q = mc.state.getQ().to_numpy().copy()
         mc.cache_body_scale_group_joints()
         self.station_caches = []
-        for measurement in self.measurements:
+        for measurement in cost.measurements:
             sc1 = StationCache.from_station(
                 mc, mc.model.getComponent(measurement.station1_path))
             sc2 = StationCache.from_station(
@@ -1111,13 +1302,9 @@ class AnthropometricRegularizationCost(CallbackCost):
             axis = measurement.axis.value if measurement.axis is not None else None
             self.station_caches.append((sc1, sc2, axis))
         Function.__init__(self, 'anthropometric_regularization_cost', mc,
-                          enable_fd=self.enable_fd)
+                          enable_fd=enable_fd)
 
     def __call__(self, input: CostInput) -> ca.MX:
-        if self.station_caches is None:
-            raise RuntimeError(
-                'AnthropometricRegularizationCost.initialize(...) must be called '
-                'before evaluation; a solver does this automatically in solve().')
         return ca.Function.__call__(self, input.body_scales)
 
     def _get_num_inputs(self):
@@ -1145,8 +1332,9 @@ class AnthropometricRegularizationCost(CallbackCost):
             measurements[i] = (np.linalg.norm(displacement) if axis is None
                                else abs(displacement[axis]))
 
-        residual = measurements - self.mean
-        return [float(self.weight * 0.5 * residual @ self.precision @ residual)]
+        residual = measurements - self.cost.mean
+        return [float(self.cost.weight * 0.5 * residual
+                      @ self.cost.precision @ residual)]
 
     def _jac_eval(self, arg):
         body_scales = np.atleast_1d(np.squeeze(arg[0].full())).astype(float)
@@ -1173,6 +1361,6 @@ class AnthropometricRegularizationCost(CallbackCost):
                 value = displacement[axis]
                 m[i] = abs(value)
                 jacobian[i, :] = np.sign(value) * displacement_jacobian[axis, :]
-        residual = m - self.mean
-        gradient = self.weight * (self.precision @ residual) @ jacobian
+        residual = m - self.cost.mean
+        gradient = self.cost.weight * (self.cost.precision @ residual) @ jacobian
         return [gradient.reshape(1, num_scales)]

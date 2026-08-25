@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import opensim as osim
-from osimfit.data_sources import MarkerSource
+from osimfit.data_sources import MarkerSource, Trial
 from osimfit.solvers import SplinedKinematicsSolver
 from osimfit.model import BodyScale
 from osimfit.costs import BodyScaleRegularizationCost
@@ -97,7 +97,7 @@ model.initSystem()
 # Create a MarkerSource.
 labels = marker_table.getColumnLabels()
 label_map = {label: label.replace('|location', '') for label in labels}
-marker_source = MarkerSource('markers.trc', label_map=label_map)
+marker_source = MarkerSource('markers', 'markers.trc', label_map=label_map)
 
 # Construct a SplinedKinematicsSolver to solve for the model kinematics and body
 # lengths that best match the marker data.
@@ -105,7 +105,7 @@ solver = SplinedKinematicsSolver(model,
                                  convergence_tolerance=1e-5,
                                  knot_interval=0.05,
                                  position_weight=5.0)
-solver.add_marker_reference_data(marker_source)
+solver.add_trial(Trial('pendulum', [marker_source]))
 solver.add_cost(BodyScaleRegularizationCost(1e-2))
 # Add body scales for the two bodies including lower and upper bounds for the
 # optimization variables.
@@ -114,10 +114,11 @@ solver.add_parameter(BodyScale('/bodyset/b1', Bounds(0.5, 2.0), np.ones(3)))
 
 # Solve!
 solution = solver.solve()
+states_table = solution.states_tables['pendulum']
 
 # Write the solution to a .sto file.
 sto = osim.STOFileAdapter()
-sto.write(solution.states_table, 'double_pendulum_ik_solution.sto')
+sto.write(states_table, 'double_pendulum_ik_solution.sto')
 
 # Print the optimized body lengths.
 print("\nOptimized body lengths")
@@ -132,8 +133,8 @@ coordinates  = ['/jointset/j0/q0/value', '/jointset/j1/q1/value']
 ylabels = ['q0 (rad)', 'q1 (rad)']
 fig, axes = plt.subplots(2, 1, figsize=(5, 4), sharex=True)
 for i, coord in enumerate(coordinates):
-    axes[i].plot(solution.states_table.getIndependentColumn(),
-                 solution.states_table.getDependentColumn(coord),
+    axes[i].plot(states_table.getIndependentColumn(),
+                 states_table.getDependentColumn(coord),
                  label='fitting solution', linewidth=4)
     axes[i].plot(states.getIndependentColumn(),
                  states.getDependentColumn(coord),
