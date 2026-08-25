@@ -13,7 +13,7 @@ from osimfit.model import MarkerOffsetGroup, MarkerOffset, FrameOffset
 from osimfit.costs import OffsetRegularizationCost
 from osimfit.bounds import Bounds
 
-from test_scaled_double_pendulum import create_double_pendulum
+from tests.test_double_pendulum import create_double_pendulum
 
 ###########
 # HELPERS #

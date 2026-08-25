@@ -9,7 +9,8 @@ from osimfit.scaling import (Axis, PositionBasedScaler, MarkerMeasurement,
 from osimfit.solvers import (InverseKinematicsSolver, MarkerPlacer,
                              SplinedKinematicsSolver, SplinedKinematicsSolution)
 from osimfit.model import BodyScale, MarkerOffset
-from osimfit.costs import BodyScaleRegularizationCost, OffsetRegularizationCost
+from osimfit.costs import (AnthropometricRegularizationCost, OffsetRegularizationCost,
+                           BodyScaleIsotropyCost)
 from osimfit.bounds import Bounds
 from osimfit.utilities import (compute_marker_errors, plot_marker_errors,
                                plot_coordinates)
@@ -154,17 +155,15 @@ position_scaler.add_symmetry_pair('toes_l', 'toes_r')
 scaled_model = position_scaler.scale()
 scaled_model.printToXML('subject_marker_scaled_run.osim')
 
-# Anthropometry-based scaling
+# Anthropometric measurements
 # ---------------------------
-# Next, we will adjust the scaled model based on anthropometric measurements from the
-# ANSUR II dataset.
-
-# Define a mapping between ANSUR II measurement labels and pairs of stations (e.g.,
-# body-fixed points) representing the measurement, along with the axis along which to
-# apply the measurement. If no axis is specified, the measurement will be applied
-# isotropically.
-# ansur_label --> (station1_path, station2_path, axis)
-ansur_measurements = {
+# Define the list of anthropometric measurements from the ANSUR II dataset that will
+# regularize the body scales during the bilevel optimization below. Each
+# `AnthropometricMeasurement` object contains the name of the measurement, paths to two
+# `Station`s in the model from which the measurement is computed, and the axis along
+# which the measurement is taken. If no axis is specified, the measurement is the
+# Euclidean distance between the two stations.
+ansur_measurements_map = {
     'biacromialbreadth':      ('/acromion_r', '/acromion_l', None),
     'bicristalbreadth':       ('/iliocrestale_r', '/iliocrestale_l', None),
     'bimalleolarbreadth':     ('/lateral_malleolus_r', '/medial_malleolus_r', None),
@@ -181,63 +180,10 @@ ansur_measurements = {
     'waistbacklength':        ('/cervicale', '/posterior_omphalion', None),
     'waistdepth':             ('/posterior_omphalion', '/anterior_omphalion', None),
 }
-
-# Create the AnthropometricScaler and add measurements based on the mapping above.
-anthropometric_scaler = AnthropometricScaler(scaled_model, sex='female')
-
-# Build the measurements once so we can reuse them by label below.
-ansur_measurement_map = {
-    label: AnthropometricMeasurement(station1_path, station2_path, axis)
-    for label, (station1_path, station2_path, axis) in ansur_measurements.items()
-}
-
-# Register every measurement so it participates in the joint MVN distribution.
-# Measurements directly used by body scales will be registered redundantly by the
-# harvest step inside scale() — that's harmless.
-for ansur_label, measurement in ansur_measurement_map.items():
-    anthropometric_scaler.add_measurement(ansur_label, measurement)
-
-# Select a subset of the measurements that we will use to condition the
-# multivariate normal distribution. These measurements are "trustworthy" in the
-# sense that we can estimate them relatively well from the Theia frames.
-anthropometric_scaler.add_conditional_measurement('iliocristaleheight')
-anthropometric_scaler.add_conditional_measurement('radialestylionlength')
-anthropometric_scaler.add_conditional_measurement('shoulderelbowlength')
-anthropometric_scaler.add_conditional_measurement('stature')
-anthropometric_scaler.add_conditional_measurement('suprasternaleheight')
-anthropometric_scaler.add_conditional_measurement('tibialheight')
-anthropometric_scaler.add_conditional_measurement('trochanterionheight')
-anthropometric_scaler.add_conditional_measurement('waistbacklength')
-
-# Define the body scales that will be generated from the conditioned anthropometric
-# measurements.
-anthro_scale_rules = [
-    ('torso',   'biacromialbreadth',     Axis.ZAxis),
-    ('pelvis',  'bicristalbreadth',      Axis.ZAxis),
-    ('tibia_r', 'bimalleolarbreadth',    Axis.YAxis),
-    ('tibia_r', 'bimalleolarbreadth',    Axis.ZAxis),
-    ('tibia_l', 'bimalleolarbreadth',    Axis.YAxis),
-    ('tibia_l', 'bimalleolarbreadth',    Axis.ZAxis),
-    ('calcn_r', 'footlength',            Axis.XAxis),
-    ('calcn_r', 'footbreadthhorizontal', Axis.ZAxis),
-    ('toes_r',  'footlength',            Axis.XAxis),
-    ('toes_r',  'footbreadthhorizontal', Axis.ZAxis),
-    ('calcn_l', 'footlength',            Axis.XAxis),
-    ('calcn_l', 'footbreadthhorizontal', Axis.ZAxis),
-    ('toes_l',  'footlength',            Axis.XAxis),
-    ('toes_l',  'footbreadthhorizontal', Axis.ZAxis),
-    ('talus_r',  'footlength',            Axis.XAxis),
-    ('talus_r',  'footbreadthhorizontal', Axis.ZAxis),
-    ('talus_l',  'footlength',            Axis.XAxis),
-    ('talus_l',  'footbreadthhorizontal', Axis.ZAxis),
-]
-for segment, ansur_label, axis in anthro_scale_rules:
-    anthropometric_scaler.add_anthropometric_body_scale(
-        segment, axis, ansur_label)
-
-# Scale the model.
-anthro_scaled_model = anthropometric_scaler.scale()
-anthro_scaled_model.printToXML('subject_anthro_scaled_run.osim')
+ansur_measurements: list[AnthropometricMeasurement] = []
+for name, (station1_path, station2_path, axis) in ansur_measurements_map.items():
+    ansur_measurements.append(
+        AnthropometricMeasurement(name, station1_path, station2_path, axis))
 
 # Place markers
 # -------------
@@ -247,17 +193,17 @@ marker_source = MarkerSource(markers_fpath, label_map=marker_map,
                              labels_to_remove=markers_to_remove,
                              trim_to_range=time_range)
 marker_source.write('run_markers.trc')
-placer = MarkerPlacer(anthro_scaled_model, marker_source)
+placer = MarkerPlacer(scaled_model, marker_source)
 solution = placer.solve()
-# Update both 'anthro_scaled_model', which we'll use to generate a guess via inverse
+# Update both 'scaled_model', which we'll use to generate a guess via inverse
 # kinematics, and 'unscaled_model' which we'll use in the final bilevel optimization.
-anthro_scaled_model = placer.update_model(anthro_scaled_model, solution)
+scaled_model = placer.update_model(scaled_model, solution)
 unscaled_model = placer.update_model(unscaled_model, solution)
 
 # Frame-by-frame inverse kinematics
 # ---------------------------------
 # Run the frame-by-frame IK solver.
-solver = InverseKinematicsSolver(anthro_scaled_model,
+solver = InverseKinematicsSolver(scaled_model,
                                  convergence_tolerance=1e-2,
                                  position_weight=1.0)
 solver.add_marker_reference_data(marker_source)
@@ -268,7 +214,7 @@ sto.write(ik_solution.states_table, 'run_ik_solution.sto')
 # Convert the solution to a StatesTrajectory for computing marker errors.
 states_table = osim.TimeSeriesTable('run_ik_solution.sto')
 states_table.addTableMetaDataString('inDegrees', 'no')
-states_traj = osim.StatesTrajectory.createFromStatesTable(anthro_scaled_model,
+states_traj = osim.StatesTrajectory.createFromStatesTable(scaled_model,
                                                           states_table, True)
 
 # Spline-based inverse kinematics
@@ -280,8 +226,21 @@ solver = SplinedKinematicsSolver(unscaled_model,
                                  knot_interval=0.05,
                                  position_weight=1.0)
 solver.add_marker_reference_data(marker_source)
-solver.add_cost(BodyScaleRegularizationCost(1e-1))
-solver.add_cost(OffsetRegularizationCost(1e-3))
+
+# Add additional cost terms to the solver.
+#
+# A regularization penalty on body-scale factors that maximizes the log-likelihood that
+# a set of anthropometric measurements (that are function of body scales) fall within a
+# distribution fit to the ANSUR II dataset.
+solver.add_cost(AnthropometricRegularizationCost(
+    ansur_measurements, sex='female', weight=1e-3))
+# Penalize component (i.e., X, Y, or Z) body scales that deviate far from the mean
+# across the three component scales. In other words, encourage the body to scale
+# isotropically.
+solver.add_cost(BodyScaleIsotropyCost(weight=1e-1))
+# Penalize marker and frame offsets that deviate far from their nominal values.
+solver.add_cost(OffsetRegularizationCost(weight=1e-3))
+
 # Add body scales for each body in the model. Apply the same scales to groups of bodies,
 # including those that should share left-right symmetry.
 bounds = Bounds(0.5, 1.5)
@@ -312,22 +271,15 @@ for i in range(unscaled_model.getMarkerSet().getSize()):
     elif not path.endswith('JC'):
         solver.add_parameter(MarkerOffset(path, anatomical_bounds, np.zeros(3)))
 
-# Combine the per-body XYZ body scales from the two scaling stages above by
-# element-wise multiplication.
-def per_body_factors(scaleset, body_name):
-    factors = scaleset.get(body_name).getScaleFactors()
-    return np.array([factors[0], factors[1], factors[2]])
-
+# Gather the per-body XYZ body scales from the position-based scaling stage above,
+# averaging over the bodies in each parameter group.
+scaleset = position_scaler.scaleset
 parameters_guess = [p.with_value(p.value) for p in solver.parameters]
-body_scales = [p for p in parameters_guess if isinstance(p, BodyScale)]
-for scale in body_scales:
-    per_body = []
-    for body_path in scale.paths:
-        body_name = body_path.rsplit('/', 1)[-1]
-        per_body.append(
-            per_body_factors(position_scaler.scaleset, body_name)
-            * per_body_factors(anthropometric_scaler.scaleset, body_name))
-    scale.value = np.mean(per_body, axis=0)
+for scale in parameters_guess:
+    if isinstance(scale, BodyScale):
+        factors = [scaleset.get(path.rsplit('/', 1)[-1]).getScaleFactors().to_numpy()
+                   for path in scale.paths]
+        scale.value = np.mean(factors, axis=0)
 
 # Create an initial guess based on the the kinematics from the inverse kinematics
 # solution and the combined body scales set above.

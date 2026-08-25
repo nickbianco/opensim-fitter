@@ -1,12 +1,10 @@
-import os
 import numpy as np
-import pandas as pd
 import opensim as osim
 from enum import Enum
 import collections
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from .utilities import MultivariateNormal
+from .anthropometrics import build_ansur_distribution
 from .data_sources import DataSource
 
 class Axis(Enum):
@@ -312,11 +310,13 @@ class PositionBasedScaler(Scaler):
 
 class AnthropometricMeasurement(ABC):
     """
-    Computes the distance between two named stations in the model, in millimeters, for
+    Computes the distance between two named stations in the model, in meters, for
     comparison against entries in the ANSUR II anthropometric dataset.
 
     Parameters
     ----------
+    name: str
+        The name of the measurement in the ANSUR II data (e.g., 'biacromialbreadth').
     station1_path: str
         Component path to the first station in the model.
     station2_path: str
@@ -325,8 +325,10 @@ class AnthropometricMeasurement(ABC):
         If provided, returns the signed distance along the specified axis rather than
         the Euclidean magnitude.
     """
-    def __init__(self, station1_path: str, station2_path: str, axis: Axis = None):
+    def __init__(self, name: str, station1_path: str, station2_path: str,
+                 axis: Axis = None):
         super().__init__()
+        self.name = name
         self.station1_path = station1_path
         self.station2_path = station2_path
         self.axis = axis
@@ -342,12 +344,11 @@ class AnthropometricMeasurement(ABC):
         difference = station2_position - station1_position
 
         # If an axis is specified, return the absolute value of the difference along
-        # that axis. Otherwise, return the magnitude of the difference vector. In both
-        # cases, convert from meters to millimeters to match the ANSUR II dataset.
+        # that axis. Otherwise, return the magnitude of the difference vector.
         if self.axis is not None:
-            return 1000.0 * np.abs(difference[self.axis.value])
+            return np.abs(difference[self.axis.value])
         else:
-            return 1000.0 * np.linalg.norm(difference)
+            return np.linalg.norm(difference)
 
 
 @dataclass
@@ -373,24 +374,22 @@ class AnthropometricBodyScale(BodyScale):
         See :py:class:`BodyScale`.
     axis: Axis
         See :py:class:`BodyScale`.
-    ansur_label : str
-        ANSUR II label identifying the measurement.
     measurement : AnthropometricMeasurement
-        Measurement used to compute the model-side value.
+        Measurement used to compute the model-side value. Its `name` identifies the
+        ANSUR II label whose values are read from `context`.
     context : AnthropometricContext
         Shared context populated by the scaler before `append_body_scale` runs.
     """
-    def __init__(self, body_name: str, axis: Axis, ansur_label: str,
+    def __init__(self, body_name: str, axis: Axis,
                  measurement: AnthropometricMeasurement,
                  context: AnthropometricContext):
         super().__init__(body_name, axis)
-        self.ansur_label = ansur_label
         self.measurement = measurement
         self.context = context
 
     def get_body_scale(self, model: osim.Model, state: osim.State) -> float:
-        model_value = self.context.model_values[self.ansur_label]
-        conditioned_value = self.context.conditioned_values[self.ansur_label]
+        model_value = self.context.model_values[self.measurement.name]
+        conditioned_value = self.context.conditioned_values[self.measurement.name]
         return conditioned_value / model_value
 
 
@@ -437,15 +436,12 @@ class AnthropometricScaler(Scaler):
         scaler = AnthropometricScaler(model, sex='female')
 
         # Register every measurement that participates in the joint MVN.
-        scaler.add_measurement(
-            'stature',
-            AnthropometricMeasurement('/vertex', '/mtp5_r', Axis.YAxis))
-        scaler.add_measurement(
-            'tibialheight',
-            AnthropometricMeasurement('/tibiale_r', '/mtp5_r', Axis.YAxis))
-        scaler.add_measurement(
-            'biacromialbreadth',
-            AnthropometricMeasurement('/acromion_r', '/acromion_l'))
+        scaler.add_measurement(AnthropometricMeasurement(
+            'stature', '/vertex', '/mtp5_r', Axis.YAxis))
+        scaler.add_measurement(AnthropometricMeasurement(
+            'tibialheight', '/tibiale_r', '/mtp5_r', Axis.YAxis))
+        scaler.add_measurement(AnthropometricMeasurement(
+            'biacromialbreadth', '/acromion_r', '/acromion_l'))
 
         # Trust the model-side values for these measurements; the others are
         # inferred from the conditioned MVN.
@@ -470,8 +466,8 @@ class AnthropometricScaler(Scaler):
 
     Attributes
     ----------
-    measurements: dict[str, AnthropometricMeasurement]
-        Registered measurements keyed by ANSUR II label.
+    measurements: list[AnthropometricMeasurement]
+        The list of registered anthropometric measurements.
     conditional_measurements: list[str]
         Labels of measurements used to condition the MVN distribution.
     context: AnthropometricContext
@@ -480,21 +476,12 @@ class AnthropometricScaler(Scaler):
     """
     def __init__(self, model: osim.Model, sex: str = None):
         super().__init__(model)
-        self.measurements: dict[str, AnthropometricMeasurement] = {}
+        self.measurements: list[AnthropometricMeasurement] = []
         self.conditional_measurements: list[str] = []
         self.context = AnthropometricContext()
+        self.sex = sex
 
-        sex_tag = 'BOTH'
-        if sex and sex.lower() == 'male':
-            sex_tag = 'MALE'
-        elif sex and sex.lower() == 'female':
-            sex_tag = 'FEMALE'
-        self.anthropometrics_fpath = os.path.join(os.path.dirname(__file__),
-                                                  'anthropometrics',
-                                                  f'ANSUR_II_{sex_tag}_Public.csv')
-
-    def add_measurement(self, ansur_label: str,
-                        measurement: AnthropometricMeasurement) -> None:
+    def add_measurement(self, measurement: AnthropometricMeasurement) -> None:
         """
         Register an anthropometric measurement. Use this for measurements that need
         to participate in the joint multivariate normal distribution but are not
@@ -503,13 +490,36 @@ class AnthropometricScaler(Scaler):
 
         Parameters
         ----------
-        ansur_label: str
-            The label to an anthropometric measurement used in the ANSUR II dataset.
         measurement: AnthropometricMeasurement
             A model-based computation of anthropometric measurement from the ANSUR II
             dataset.
         """
-        self.measurements[ansur_label] = measurement
+        self.measurements.append(measurement)
+
+    def get_measurement(self, ansur_label: str) -> AnthropometricMeasurement:
+        """
+        Return the anthropometric measurement for a given measurement label.
+
+        Parameters
+        ----------
+        ansur_label: str
+            A label matching one of the measurement names in the ANSUR II dataset.
+
+        Raises
+        ------
+        ValueError
+            If `ansur_label` has not been registered via `add_measurement`.
+        """
+        for measurement in self.measurements:
+            if measurement.name == ansur_label:
+                return measurement
+
+        raise ValueError(
+            f"No anthropometric measurement registered for '{ansur_label}'.")
+
+    @property
+    def measurement_labels(self) -> list[str]:
+        return [m.name for m in self.measurements]
 
     def add_conditional_measurement(self, ansur_label: str) -> None:
         """
@@ -524,7 +534,7 @@ class AnthropometricScaler(Scaler):
         self.conditional_measurements.append(ansur_label)
 
     def add_anthropometric_body_scale(self, body_name: str, axis: Axis,
-                                        ansur_label: str) -> None:
+                                      ansur_label: str) -> None:
         """
         Build an `AnthropometricBodyScale` with the scaler's shared context
         auto-filled, and register it. The associated `AnthropometricMeasurement`
@@ -545,35 +555,19 @@ class AnthropometricScaler(Scaler):
         ValueError
             If `ansur_label` has not been registered via `add_measurement`.
         """
-        if ansur_label not in self.measurements:
-            raise ValueError(
-                f"No anthropometric measurement registered for '{ansur_label}'. "
-                f"Call add_measurement('{ansur_label}', ...) before adding a "
-                f"body scale for it.")
         self.add_body_scale(AnthropometricBodyScale(
-            body_name, axis, ansur_label, self.measurements[ansur_label],
-            self.context))
+            body_name, axis, self.get_measurement(ansur_label), self.context))
 
     def scale(self):
-        # Load anthropometric measurements from the ANSUR II dataset.
-        df = pd.read_csv(self.anthropometrics_fpath, encoding_errors='replace')
-        ansur_labels = list(self.measurements.keys())
-        for label in ansur_labels:
-            if label not in df.columns:
-                raise ValueError(f"The anthropometric measurement '{label}' was "
-                                 f"provided, but it is not present in the ANSUR II "
-                                 f"dataset.")
-
-        # Construct a multivariate normal distribution over the anthropometric
-        # measurements.
-        df = df[self.measurements.keys()]
-        mvn = MultivariateNormal.from_data(df.columns.tolist(), df.values)
+        # Fit a multivariate normal distribution over the registered anthropometric
+        # measurements from the ANSUR II dataset (in meters).
+        mvn = build_ansur_distribution(self.measurement_labels, self.sex)
 
         # Compute the values of the model measurements corresponding to the provided
         # anthropometric measurements.
         self.context.model_values.clear()
-        for ansur_label, measurement in self.measurements.items():
-            self.context.model_values[ansur_label] = measurement.compute_measurement(
+        for m in self.measurements:
+            self.context.model_values[m.name] = m.compute_measurement(
                 self.model, self.state)
 
         # Condition the multivariate normal distribution on the selected measurements.

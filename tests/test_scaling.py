@@ -144,27 +144,26 @@ def test_marker_measurement_returns_offset_distance():
 # ANTHROPOMETRIC MEASUREMENT #
 ##############################
 
-def test_anthropometric_no_axis_returns_mm_magnitude():
+def test_anthropometric_no_axis_returns_meter_magnitude():
     model = create_one_body_test_model()
     state = model.initSystem()
-    measurement = AnthropometricMeasurement('/s0', '/s1')
-    # 0.5 m * 1000 = 500 mm.
+    measurement = AnthropometricMeasurement('stature', '/s0', '/s1')
     assert measurement.compute_measurement(model, state) == pytest.approx(
-        500.0, abs=1e-9)
+        0.5, abs=1e-9)
 
 
-def test_anthropometric_x_axis_returns_mm_along_x():
+def test_anthropometric_x_axis_returns_meters_along_x():
     model = create_one_body_test_model()
     state = model.initSystem()
-    measurement = AnthropometricMeasurement('/s0', '/s1', axis=Axis.XAxis)
+    measurement = AnthropometricMeasurement('stature', '/s0', '/s1', axis=Axis.XAxis)
     assert measurement.compute_measurement(model, state) == pytest.approx(
-        500.0, abs=1e-9)
+        0.5, abs=1e-9)
 
 
 def test_anthropometric_y_axis_returns_zero_for_pure_x_offset():
     model = create_one_body_test_model()
     state = model.initSystem()
-    measurement = AnthropometricMeasurement('/s0', '/s1', axis=Axis.YAxis)
+    measurement = AnthropometricMeasurement('stature', '/s0', '/s1', axis=Axis.YAxis)
     assert measurement.compute_measurement(model, state) == pytest.approx(
         0.0, abs=1e-9)
 
@@ -172,7 +171,7 @@ def test_anthropometric_y_axis_returns_zero_for_pure_x_offset():
 def test_anthropometric_z_axis_returns_zero_for_pure_x_offset():
     model = create_one_body_test_model()
     state = model.initSystem()
-    measurement = AnthropometricMeasurement('/s0', '/s1', axis=Axis.ZAxis)
+    measurement = AnthropometricMeasurement('stature', '/s0', '/s1', axis=Axis.ZAxis)
     assert measurement.compute_measurement(model, state) == pytest.approx(
         0.0, abs=1e-9)
 
@@ -266,8 +265,8 @@ def test_anthropometric_body_scale_applies_expected_scale():
     scaler = AnthropometricScaler(model)
     scaler.context.model_values['mylabel'] = 100.0
     scaler.context.conditioned_values['mylabel'] = 200.0
-    measurement = AnthropometricMeasurement('/s0', '/s1')
-    scaler.add_measurement('mylabel', measurement)
+    measurement = AnthropometricMeasurement('mylabel', '/s0', '/s1')
+    scaler.add_measurement(measurement)
     scaler.add_anthropometric_body_scale('rig_body', Axis.YAxis, 'mylabel')
 
     scaler.populate_scaleset()
