@@ -1,20 +1,24 @@
-"""Sandbox: plugging a statistical shape model into opensim-fitter's NLP the
-same way a body scale already does -- a small parameter vector `s` in,
-morphed geometry out, through a CasADi callback with an analytic Jacobian.
+"""Sandbox: plugging a statistical shape model into opensim-fitter's bilevel
+machinery -- a small, self-contained worked example, deliberately decoupled from the
+real code so it can be read start to finish without jumping into osimfit.
 
-`ShapeModel` is the interface a shape model needs to implement:
-`n_params`/`nominal`/`bounds` describe `s`, `apply(s)` morphs the geometry,
-`geometry_jacobian(s)` is its exact derivative, and `prior(s)` regularizes
-implausible `s`. `FemurHeadShapeModel` is one real implementation, built
-from a real 536-subject femur+hip PCA: it morphs a femoral-head landmark
-patch and fits a sphere through it.
+The real integration (see SHAPE_MODEL.md) has two layers on top of what's here:
 
-`ShapeModelCallback` wraps any `ShapeModel` as a CasADi `Callback`, the same
-way `PositionCallback`/`PositionCallback_Jac` in sandbox_jacobians.py wrap a
-generalized coordinate `q` -- needed because `apply`/`geometry_jacobian`
-call real NumPy linear algebra CasADi can't see inside of. `prior(s)`
-doesn't need that: it's plain arithmetic, so CasADi differentiates it
-directly when `fit_shape_factor` calls it on a symbolic `s`.
+1. `osimfit.model.ShapeModel` is the same math contract as the `ShapeModel` below,
+   plus the glue that makes it a bilevel `Parameter`: `expand()` (fold `s` into a
+   marker/frame offset), `to_groups()`, `prior_expr()`, and per-path
+   `validate()`/`apply_to_model()` via `MarkerTargetMixin`/`FrameTargetMixin`. None of
+   that lives here -- this file only implements the math, not the wiring.
+2. `osimfit.callbacks.ShapeModelCallback` is the class below, promoted essentially
+   unchanged.
+
+`n_params`/`nominal`/`bounds` describe the shape factor `s`, `apply(s)` morphs
+geometry, `geometry_jacobian(s)` is its exact derivative, and `prior(s)` regularizes
+implausible `s`. `FemurHeadLandmarkShapeModel` is a real implementation, built from a
+real 536-subject femur+hip PCA: it picks one vertex on the femoral head and moves it
+along the PCA modes. That's the simplest possible linear shape model -- exactly the
+shape `osimfit.model.ShapeModel.expand()` requires (a constant `geometry_jacobian`),
+and the shape every real PCA-based SSM has.
 """
 
 import csv
@@ -28,12 +32,12 @@ DATA = Path(__file__).parent / "ssm_shape_model_data"
 
 
 class ShapeModel(ABC):
-    """s in, morphed geometry out. Every shape model must supply an exact
-    analytic `geometry_jacobian` -- no finite-difference fallback here.
+    """s in, morphed geometry out. Every shape model supplies an exact analytic
+    `geometry_jacobian` -- no finite-difference fallback here.
 
-    n_params/nominal/bounds are abstract properties rather than bare
-    annotations, so a subclass that forgets one fails at instantiation
-    instead of with an AttributeError the first time something reads it.
+    n_params/nominal/bounds are abstract properties rather than bare annotations, so a
+    subclass that forgets one fails at instantiation instead of with an
+    AttributeError the first time something reads it.
     """
 
     @property
@@ -64,31 +68,29 @@ class ShapeModel(ABC):
         """(value, grad) of the shape-factor regularizer at s."""
 
 
-class FemurHeadShapeModel(ShapeModel):
-    """Linear shape model over the femoral-head landmark patch, apply()'d
-    through a least-squares sphere fit.
+class FemurHeadLandmarkShapeModel(ShapeModel):
+    """One landmark on the femoral head, morphed along the first `n_modes` PCA modes
+    of a real 536-subject femur+hip PCA.
 
-    landmarks(s) = mean + basis @ s is exactly linear in s (basis columns =
-    sqrt(eigenvalue_i) * pc_i for each of the n_modes requested at
-    construction, so s is in standard-deviation units). `apply` is the
-    sphere center through those landmarks -- nonlinear in the landmarks, so
-    `geometry_jacobian(s)` is exact but s-dependent, not a constant.
+    landmark(s) = mean_pt + basis_pt @ s is exactly linear in s (basis columns =
+    sqrt(eigenvalue_i) * pc_i at the chosen vertex, for each requested mode, so s is
+    in standard-deviation units). Because apply() is linear, geometry_jacobian is just
+    the constant basis_pt matrix, not a function of s at all -- see __main__ below.
     """
 
-    bounds = (-3.0, 3.0)  # +/- 3 SD
-
-    def __init__(self, n_modes=1):
+    def __init__(self, n_modes=1, vertex_index=None):
         mean = np.load(DATA / "mean_shape.npy").reshape(-1, 3)
-        idx = self._load_head_indices()
-        self.mean_pts = mean[idx]
-        # (n_pts, 3, n_modes). Only mode 1 ships with this sandbox, so
-        # n_modes > 1 raises FileNotFoundError until more modes' data exists.
-        self.basis_pts = np.stack(
-            [self._load_pca_basis(mode)[idx] for mode in range(1, n_modes + 1)],
+        head_idx = self._load_head_indices()
+        # One vertex from the femoral-head patch, not an average or a surface fit
+        # through it -- the simplest possible landmark.
+        vertex_index = head_idx[0] if vertex_index is None else vertex_index
+        self.mean_pt = mean[vertex_index]
+        self.basis_pt = np.stack(
+            [self._load_pca_basis(mode)[vertex_index]
+             for mode in range(1, n_modes + 1)],
             axis=-1,
-        )
+        )  # (3, n_modes)
         self._n_params = n_modes
-        self._cache = None  # (s, p, dp) for the most recent call
 
     @property
     def n_params(self):
@@ -96,10 +98,12 @@ class FemurHeadShapeModel(ShapeModel):
 
     @property
     def nominal(self):
-        # s=0 reproduces the mean shape by construction, so nominal is
-        # always zero here (not true for every ShapeModel, hence still
-        # abstract on the base class).
+        # s=0 reproduces the mean shape by construction.
         return np.zeros(self.n_params)
+
+    @property
+    def bounds(self):
+        return (-3.0, 3.0)  # +/- 3 SD
 
     @staticmethod
     def _load_head_indices():
@@ -112,64 +116,23 @@ class FemurHeadShapeModel(ShapeModel):
 
     @staticmethod
     def _load_pca_basis(mode):
-        """One PCA mode's basis vector (sqrt(eigenvalue) * pc), from
-        `pc{mode}.npy` and `eigenvalue{mode}.npy` in DATA, both flattened to
-        (n_vertices, 3). This per-mode-file layout is specific to how this
-        sandbox's data happens to be split up -- not a convention any other
-        ShapeModel is expected to follow.
-        """
+        """One PCA mode's basis vector (sqrt(eigenvalue) * pc), from `pc{mode}.npy`
+        and `eigenvalue{mode}.npy` in DATA, both flattened to (n_vertices, 3)."""
         pc = np.load(DATA / f"pc{mode}.npy").reshape(-1, 3)
         eig = float(np.load(DATA / f"eigenvalue{mode}.npy"))
         return pc * np.sqrt(eig)
 
-    def landmarks(self, s):
-        """Morphed femoral-head point patch (m x 3) at shape factor s."""
-        return self.mean_pts + self.basis_pts @ np.asarray(s).reshape(-1)
-
-    @staticmethod
-    def _sphere_center(L, dL):
-        """Least-squares (Kasa) sphere center through points L (m x 3), plus
-        its Jacobian given dL = d(landmarks)/ds (m x 3 x n_params) --
-        differentiates the closed-form fit once per column of dL.
-        """
-        x, y, z = L[:, 0], L[:, 1], L[:, 2]
-        A = np.column_stack([2 * x, 2 * y, 2 * z, np.ones(len(L))])
-        b = x * x + y * y + z * z
-        Minv = np.linalg.inv(A.T @ A)
-        c = Minv @ (A.T @ b)
-        residual = b - A @ c
-
-        n_params = dL.shape[-1]
-        dc = np.empty((4, n_params))
-        for k in range(n_params):
-            dx, dy, dz = dL[:, 0, k], dL[:, 1, k], dL[:, 2, k]
-            dA = np.column_stack([2 * dx, 2 * dy, 2 * dz, np.zeros(len(L))])
-            db = 2 * (x * dx + y * dy + z * dz)
-            dc[:, k] = Minv @ (dA.T @ residual + A.T @ (db - dA @ c))
-        return c[:3], dc[:3]
-
-    def _sphere(self, s):
-        s = np.asarray(s).reshape(-1)
-        key = tuple(s)
-        if self._cache is None or self._cache[0] != key:
-            p, dp = self._sphere_center(self.landmarks(s), self.basis_pts)
-            self._cache = (key, p, dp)
-        return self._cache[1], self._cache[2]
-
     def apply(self, s):
-        p, _ = self._sphere(s)
-        return p
+        return self.mean_pt + self.basis_pt @ np.asarray(s).reshape(-1)
 
     def geometry_jacobian(self, s):
-        _, dp = self._sphere(s)
-        return dp
+        return self.basis_pt
 
     def prior(self, s):
-        """Mahalanobis prior in SD units: value and gradient. Written with
-        only `.T`/`@`/`*`, so it works unmodified whether s is numeric or a
-        CasADi symbol -- see fit_shape_factor, which calls this directly on
-        the symbolic decision variable instead of wrapping it in a
-        Callback.
+        """Mahalanobis prior in SD units: value and gradient. Written with only
+        `.T`/`@`/`*`, so it works unmodified whether s is numeric or a CasADi symbol
+        -- see fit_shape_factor, which calls this directly on the symbolic decision
+        variable instead of wrapping it in a Callback.
         """
         return s.T @ s, 2.0 * s
 
@@ -181,6 +144,13 @@ class ShapeModelCallback(ca.Callback):
     apply/geometry_jacobian call real NumPy linear algebra CasADi can't see
     inside of -- unlike prior(s), which is plain arithmetic and gets called
     directly on the symbolic s with no Callback at all.
+
+    In the real code (osimfit.callbacks.ShapeModelCallback, promoted from here
+    essentially unchanged), ShapeModel.expand() -- the bilevel-Parameter fast path --
+    doesn't use this: a linear shape model's Jacobian is constant, so expand() caches
+    geometry_jacobian(nominal) once as a plain matrix instead of wrapping a Callback.
+    This class is still needed wherever geometry_jacobian must be re-evaluated at a
+    changing s, e.g. fit_shape_factor below.
     """
 
     def __init__(self, name, shape_model, output_size, opts={}):
@@ -235,7 +205,7 @@ class ShapeModelCallback(ca.Callback):
 def check_jacobian_fd(shape_model, s0=0.3, eps=1e-4):
     """Analytic geometry_jacobian vs. central differences on apply -- a
     one-off correctness check for a new shape model's Jacobian."""
-    dp = shape_model.geometry_jacobian(s0).flatten()
+    dp = np.asarray(shape_model.geometry_jacobian(s0)).flatten()
     p_plus = np.asarray(shape_model.apply(s0 + eps)).flatten()
     p_minus = np.asarray(shape_model.apply(s0 - eps)).flatten()
     dp_fd = (p_plus - p_minus) / (2 * eps)
@@ -244,10 +214,10 @@ def check_jacobian_fd(shape_model, s0=0.3, eps=1e-4):
 
 def fit_shape_factor(shape_model, target, prior_weight=1e-3):
     """Recover s* by minimizing ||apply(s) - target||^2 + prior_weight *
-    prior(s) with ipopt -- the same kind of NLP osimfit's BilevelSolver runs.
-
-    TODO: once this moves into src/osimfit, add a test asserting recovery of
-    a known s* (see __main__ below for the exact check)."""
+    prior(s) with ipopt -- the same kind of NLP osimfit's BilevelSolver runs, but
+    standalone: this is the use case ShapeModel.expand() doesn't cover, since expand()
+    only folds a shape model into an existing bilevel solve, not a solve of its own.
+    """
     s = ca.MX.sym("s", shape_model.n_params)
     head = ShapeModelCallback("head", shape_model, output_size=3)
     prior_value, _ = shape_model.prior(s)
@@ -263,10 +233,10 @@ def fit_shape_factor(shape_model, target, prior_weight=1e-3):
 
 
 if __name__ == "__main__":
-    model = FemurHeadShapeModel()
+    model = FemurHeadLandmarkShapeModel()
 
-    print("analytic dp/ds at a few s0 (exact, but not constant -- apply()")
-    print("is linear in s, geometry_jacobian isn't):")
+    print("analytic dp/ds at a few s0 (exact, and constant -- apply() is linear,")
+    print("so geometry_jacobian doesn't actually depend on s0):")
     for s0 in (-2.0, 0.0, 2.0):
         dp, dp_fd = check_jacobian_fd(model, s0=s0)
         print(f"  s0={s0:5.1f}  analytic={dp}  max FD diff={np.max(np.abs(dp - dp_fd)):.2e}")
