@@ -31,11 +31,21 @@ class PositionsOnlySource(DataSource):
     Used to construct a PositionBasedScaler without touching the filesystem.
     """
     def __init__(self, positions_table):
-        super().__init__()
+        super().__init__('positions')
         self._positions_table = positions_table
+
+    def _provides_positions(self):
+        return True
+
+    def _provides_orientations(self):
+        return False
 
     def _create_positions_table(self):
         return self._positions_table
+
+    def _create_orientations_table(self):
+        raise NotImplementedError(
+            f"PositionsSource does not provide orientation data.")
 
 
 def load_full_body_model():

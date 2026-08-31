@@ -2,7 +2,7 @@ import copy
 import numpy as np
 import opensim as osim
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .bounds import Bounds
 
@@ -25,17 +25,16 @@ class BodyScaleGroup:
     mobod_indexes: list[int]
         `MobilizedBodyIndex` values for the bodies in this group, paired with
         body_paths.
-    inboard_joints: list[osim.Joint]
-        A list of `Joint`s whose inboard frames correspond to the `MobilizedBodyIndex`
-        values in `mobod_indexes`.
-    outboard_joints: list[osim.Joint]
-        A list of `Joint`s whose outboard frames correspond to the `MobilizedBodyIndex`
-        values in `mobod_indexes`.
+
+    Notes
+    -----
+    A group holds only model-independent descriptors, so the same group may be
+    registered on more than one `ModelCache`. The `Joint`s whose mobilizer frames
+    scale with the group are model-specific and are therefore cached on the
+    `ModelCache`; see `ModelCache.cache_body_scale_group_joints`.
     """
     body_paths: list[str]
     mobod_indexes: list[int]
-    inboard_joints: list[osim.Joint] = field(default_factory=list, compare=False)
-    outboard_joints: list[osim.Joint] = field(default_factory=list, compare=False)
 
 
 @dataclass
@@ -86,8 +85,6 @@ class ModelCache:
         The wrapped OpenSim model.
     state: osim.State
         The model's working state (snapshot at construction time).
-    matter: osim.SimbodyMatterSubsystem
-        The cached matter subsystem reference.
     num_mobod: int
         Total Simbody mobod count, including Ground at index 0.
     coordinate_map: dict[str, int]
@@ -109,12 +106,19 @@ class ModelCache:
         Inverse of ``parent_of``: ``children_of[k]`` is the list of mobod
         indexes whose parent is ``k``. Every mobod (including Ground at 0)
         has an entry, possibly empty.
+    body_scale_group_inboard_joints: list[list[osim.Joint]]
+        Per-`BodyScaleGroup` `Joint`s whose inboard (X_PF) mobilizer frames scale
+        with that group, parallel to `body_scale_groups`. Populated by
+        `cache_body_scale_group_joints`.
+    body_scale_group_outboard_joints: list[list[osim.Joint]]
+        Per-`BodyScaleGroup` `Joint`s whose outboard (X_BM) mobilizer frames scale
+        with that group, parallel to `body_scale_groups`. Populated by
+        `cache_body_scale_group_joints`.
     """
     def __init__(self, model: str | osim.Model):
         modelProcessor = osim.ModelProcessor(model)
         self.model = modelProcessor.process()
         self.state = self.model.initSystem()
-        self.matter = self.model.getMatterSubsystem()
         self.num_mobod = self.model.getNumBodies() + 1
         self.coordinate_map = self._get_coordinate_index_map(self.model,
                                                     skip_dependent_coordinates=True)
@@ -122,6 +126,8 @@ class ModelCache:
         self.body_scale_groups: list[BodyScaleGroup] = []
         self.marker_offset_groups: list[MarkerOffsetGroup] = []
         self.frame_offset_groups: list[FrameOffsetGroup] = []
+        self.body_scale_group_inboard_joints: list[list[osim.Joint]] = []
+        self.body_scale_group_outboard_joints: list[list[osim.Joint]] = []
 
         # For now, disallow models with joints where qdot != u.
         assert(self.state.getNQ() == self.state.getNU())
@@ -239,19 +245,24 @@ class ModelCache:
 
     def cache_body_scale_group_joints(self) -> None:
         """
-        Populate each registered `BodyScaleGroup`'s `outboard_joints` and
-        `inboard_joints` with the `Joint`s whose mobilizer frames scale with that group:
-        the outboard (X_BM) frame of each group body's joint, and the inboard (X_PF)
-        frame of every joint driving a group body's child.
+        Populate `body_scale_group_outboard_joints` and
+        `body_scale_group_inboard_joints` with the `Joint`s whose mobilizer frames
+        scale with each registered `BodyScaleGroup`: the outboard (X_BM) frame of each
+        group body's joint, and the inboard (X_PF) frame of every joint driving a group
+        body's child.
+
+        The `Joint`s belong to this `ModelCache`'s model, so they are cached here rather
+        than on the groups, which may be shared across `ModelCache`s.
         """
-        for group in self.body_scale_groups:
-            group.outboard_joints = [
-                self.get_joint_for_mobilized_body_index(int(k))
-                for k in group.mobod_indexes]
-            group.inboard_joints = [
-                self.get_joint_for_mobilized_body_index(c)
-                for k in group.mobod_indexes
-                for c in self.children_of[int(k)]]
+        self.body_scale_group_outboard_joints = [
+            [self.get_joint_for_mobilized_body_index(int(k))
+             for k in group.mobod_indexes]
+            for group in self.body_scale_groups]
+        self.body_scale_group_inboard_joints = [
+            [self.get_joint_for_mobilized_body_index(c)
+             for k in group.mobod_indexes
+             for c in self.children_of[int(k)]]
+            for group in self.body_scale_groups]
 
     def set_scaled_mobilizer_frame_positions(self, state: osim.State,
                                              body_scales: np.ndarray) -> None:
@@ -272,11 +283,18 @@ class ModelCache:
         body_scales: np.ndarray, shape (3 * len(body_scale_groups),)
             Flat XYZ body-scale variables, one Vec3 per BodyScaleGroup.
         """
-        for i, group in enumerate(self.body_scale_groups):
+        num_groups = len(self.body_scale_groups)
+        if (len(self.body_scale_group_outboard_joints) != num_groups
+                or len(self.body_scale_group_inboard_joints) != num_groups):
+            raise RuntimeError(
+                'cache_body_scale_group_joints() must be called after the last body '
+                'scale group is registered and before scaled mobilizer frames are set.')
+
+        for i in range(num_groups):
             s = np.asarray(body_scales[3*i : 3*i+3], dtype=float)
 
             # Outboard frame (X_BM) attached to each group body.
-            for joint in group.outboard_joints:
+            for joint in self.body_scale_group_outboard_joints[i]:
                 k = int(joint.getChildFrame().getMobilizedBodyIndex())
                 p_BM = self.baseline_p_BM[k] * s
                 X_BM = osim.Transform(self.baseline_R_BM[k], osim.Vec3(
@@ -284,7 +302,7 @@ class ModelCache:
                 joint.setOutboardFrame(state, X_BM)
 
             # Inboard frame (X_PF) of every joint driving a group body's child.
-            for joint in group.inboard_joints:
+            for joint in self.body_scale_group_inboard_joints[i]:
                 c = int(joint.getChildFrame().getMobilizedBodyIndex())
                 p_PF = self.baseline_p_PF[c] * s
                 X_PF = osim.Transform(self.baseline_R_PF[c], osim.Vec3(

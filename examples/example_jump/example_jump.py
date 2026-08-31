@@ -3,11 +3,10 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import opensim as osim
-from osimfit.data_sources import TheiaFrameSource
+from osimfit.data_sources import TheiaFrameSource, Trial
 from osimfit.scaling import PositionBasedScaler, FrameMeasurement, Axis, \
                             AnthropometricScaler, AnthropometricMeasurement
-from osimfit.solvers import (InverseKinematicsSolver, SplinedKinematicsSolver,
-                             SplinedKinematicsSolution)
+from osimfit.solvers import InverseKinematicsSolver, SplinedKinematicsSolver
 from osimfit.model import BodyScale
 from osimfit.bounds import Bounds
 
@@ -78,7 +77,7 @@ model.initSystem()
 # Save a clone of the unscaled model for the bilevel optimization below.
 unscaled_model = osim.Model(model)
 
-c3d_source = TheiaFrameSource('pose_0.c3d')
+c3d_source = TheiaFrameSource('pose_0_frames', 'pose_0.c3d')
 position_scaler = PositionBasedScaler(model, c3d_source)
 
 # Add scaling rules to the PositionBasedScaler based on the mapping above.
@@ -171,7 +170,7 @@ anthro_scaled_model.printToXML('jump_1_anthro_scaled.osim')
 # Reload the Theia frame data, now discarding any unused data columns and updating the
 # frame labels to match the model frame paths.
 columns_to_remove = ['worldbody', 'head', 'pelvis_shifted', 'l_clavicle', 'r_clavicle']
-theia_frame_source = TheiaFrameSource('pose_0.c3d',
+theia_frame_source = TheiaFrameSource('pose_0_frames', 'pose_0.c3d',
                                       labels_to_remove=columns_to_remove,
                                       label_map=frame_map)
 
@@ -180,10 +179,10 @@ solver = InverseKinematicsSolver(anthro_scaled_model,
                                  convergence_tolerance=1e-3,
                                  position_weight=1.0,
                                  orientation_weight=2.0)
-solver.add_theia_frame_reference_data(theia_frame_source)
+solver.add_trial(Trial('jump_1', [theia_frame_source]))
 ik_solution = solver.solve()
 sto = osim.STOFileAdapter()
-sto.write(ik_solution.states_table, 'jump_1_ik_solution.sto')
+sto.write(ik_solution.states_tables['jump_1'], 'jump_1_ik_solution.sto')
 
 # Spline-based bilevel optimization
 # ----------------------------------
@@ -194,15 +193,11 @@ solver = SplinedKinematicsSolver(unscaled_model,
                                  knot_interval=0.05,
                                  position_weight=2.0,
                                  orientation_weight=5.0)
-solver.add_theia_frame_reference_data(theia_frame_source)
-
-# Create an initial guess based on the kinematics from the frame-by-frame inverse
-# kinematics solution and the combined body scales set above.
-guess = SplinedKinematicsSolution(
-    states_table=osim.TimeSeriesTable('jump_1_ik_solution.sto'))
-spline_ik_solution = solver.solve(guess)
+solver.add_trial(Trial('jump_1', [theia_frame_source]))
+spline_ik_solution = solver.solve(ik_solution)
 sto = osim.STOFileAdapter()
-sto.write(spline_ik_solution.states_table, 'jump_1_spline_ik_solution.sto')
+sto.write(spline_ik_solution.states_tables['jump_1'],
+          'jump_1_spline_ik_solution.sto')
 
 # Visualization
 # -------------

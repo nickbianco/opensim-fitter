@@ -3,11 +3,11 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import opensim as osim
-from osimfit.data_sources import MarkerSource
+from osimfit.data_sources import MarkerSource, Trial
 from osimfit.scaling import (Axis, PositionBasedScaler, MarkerMeasurement,
                              AnthropometricMeasurement)
 from osimfit.solvers import (InverseKinematicsSolver, MarkerPlacer,
-                             SplinedKinematicsSolver, SplinedKinematicsSolution)
+                             SplinedKinematicsSolver, Solution)
 from osimfit.model import BodyScale, MarkerOffset
 from osimfit.costs import (AnthropometricRegularizationCost, OffsetRegularizationCost,
                            BodyScaleIsotropyCost)
@@ -104,7 +104,7 @@ scale_rules = [
 
 
 # Create a MarkerSource and PositionBasedScaler.
-marker_source = MarkerSource(markers_fpath)
+marker_source = MarkerSource('walk_markers', markers_fpath)
 position_scaler = PositionBasedScaler(model, marker_source)
 
 # Add scaling rules to the PositionBasedScaler.
@@ -159,12 +159,20 @@ for name, (station1_path, station2_path, axis) in ansur_measurements_map.items()
     ansur_measurements.append(
         AnthropometricMeasurement(name, station1_path, station2_path, axis))
 
-# Place markers
-# -------------
+# Construct the trial
+# -------------------
 # Create a new marker source with updated column labels representing the full path to
 # each marker.
-marker_source = MarkerSource(markers_fpath, label_map=marker_map)
-placer = MarkerPlacer(scaled_model, marker_source)
+marker_source = MarkerSource('walk_markers', markers_fpath, label_map=marker_map)
+
+# Bundle the marker data for this motion into a Trial which we'll use in each
+# optimization step below.
+trial = Trial('walk', [marker_source])
+
+# Place markers
+# -------------
+placer = MarkerPlacer(scaled_model)
+placer.add_trial(trial)
 solution = placer.solve()
 # Update both 'scaled_model', which we'll use to generate a guess via inverse
 # kinematics, and 'unscaled_model' which we'll use in the final bilevel optimization.
@@ -177,10 +185,10 @@ unscaled_model = placer.update_model(unscaled_model, solution)
 solver = InverseKinematicsSolver(scaled_model,
                                  convergence_tolerance=1e-2,
                                  position_weight=1.0)
-solver.add_marker_reference_data(marker_source)
+solver.add_trial(trial)
 ik_solution = solver.solve()
 sto = osim.STOFileAdapter()
-sto.write(ik_solution.states_table, 'walk_ik_solution.sto')
+sto.write(ik_solution.states_tables['walk'], 'walk_ik_solution.sto')
 
 # Spline-based inverse kinematics
 # -------------------------------
@@ -190,7 +198,7 @@ solver = SplinedKinematicsSolver(unscaled_model,
                                  convergence_tolerance=1e-2,
                                  knot_interval=0.05,
                                  position_weight=5.0)
-solver.add_marker_reference_data(marker_source)
+solver.add_trial(trial)
 
 # Add additional cost terms to the solver.
 #
@@ -245,11 +253,10 @@ for scale in parameters_guess:
 
 # Create an initial guess based on the kinematics from the inverse kinematics
 # solution and the position-based body scales set above.
-guess = SplinedKinematicsSolution(
-    states_table=osim.TimeSeriesTable('walk_ik_solution.sto'),
-    parameters=parameters_guess)
+guess = Solution(states_tables=ik_solution.states_tables,
+                 parameters=parameters_guess)
 bilevel_solution = solver.solve(guess)
-sto.write(bilevel_solution.states_table, 'walk_bilevel_solution.sto')
+sto.write(bilevel_solution.states_tables['walk'], 'walk_bilevel_solution.sto')
 bilevel_scaled_model = solver.update_model(unscaled_model, bilevel_solution)
 bilevel_scaled_model.printToXML('subject_bilevel_scaled_walk.osim')
 

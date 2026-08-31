@@ -7,8 +7,8 @@ import pytest
 import numpy as np
 import opensim as osim
 
-from osimfit.data_sources import MarkerSource
-from osimfit.solvers import SplinedKinematicsSolver, SplinedKinematicsSolution
+from osimfit.data_sources import MarkerSource, Trial
+from osimfit.solvers import SplinedKinematicsSolver, Solution
 from osimfit.model import MarkerOffsetGroup, MarkerOffset, FrameOffset
 from osimfit.costs import OffsetRegularizationCost
 from osimfit.bounds import Bounds
@@ -126,8 +126,7 @@ def test_update_model_bakes_marker_and_frame_offsets():
     model.initSystem()
     solver = SplinedKinematicsSolver(model)
 
-    solution = SplinedKinematicsSolution(
-        states_table=None,
+    solution = Solution(
         parameters=[
             MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0),
                          value=np.array([0.1, -0.2, 0.3])),
@@ -152,35 +151,35 @@ def test_update_model_bakes_marker_and_frame_offsets():
 # GUESS VALIDATION #
 ####################
 
-def _make_offset_solver_and_states_table(tmp_path):
+def _make_offset_solver_and_states_tables(tmp_path):
     """
-    Build a SplinedKinematicsSolver on the offset test model with a marker offset and a
-    frame offset registered (canonical order), plus a states_table matching the
-    reference data's time samples for use as a guess.
+    Build a SplinedKinematicsSolver on the offset test model with one trial and a marker
+    offset and a frame offset registered (canonical order), plus a states-table dict
+    matching that trial's time samples for use as a guess.
     """
     trc_path = str(tmp_path / 'markers.trc')
     create_synthetic_markers(create_offset_test_model(), trc_path)
     raw_labels = osim.TimeSeriesTableVec3(trc_path).getColumnLabels()
     label_map = {label: label.replace('|location', '') for label in raw_labels}
-    marker_source = MarkerSource(trc_path, label_map=label_map)
+    marker_source = MarkerSource('markers', trc_path, label_map=label_map)
 
     solver = SplinedKinematicsSolver(create_offset_test_model())
-    solver.add_marker_reference_data(marker_source)
+    solver.add_trial(Trial('offsets', [marker_source]))
     solver.add_parameter(
         MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)))
     solver.add_parameter(
         FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)))
 
-    times = solver.get_times_from_reference_data()
+    times = solver.trials[0].times
     coords = np.zeros((len(times), len(solver.coordinate_indexes)))
-    states_table = SplinedKinematicsSolution.create_states_table(
+    states_table = Solution.create_states_table(
         solver.mc.model, solver.state, solver.coordinate_indexes, times, coords)
-    return solver, states_table
+    return solver, {'offsets': states_table}
 
 
 def test_validate_guess_accepts_canonical_parameter_order(tmp_path):
-    solver, states_table = _make_offset_solver_and_states_table(tmp_path)
-    guess = SplinedKinematicsSolution(states_table=states_table, parameters=[
+    solver, states_tables = _make_offset_solver_and_states_tables(tmp_path)
+    guess = Solution(states_tables=states_tables, parameters=[
         MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)),
         FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)),
     ])
@@ -188,13 +187,26 @@ def test_validate_guess_accepts_canonical_parameter_order(tmp_path):
 
 
 def test_validate_guess_rejects_out_of_order_parameters(tmp_path):
-    solver, states_table = _make_offset_solver_and_states_table(tmp_path)
+    solver, states_tables = _make_offset_solver_and_states_tables(tmp_path)
     # frame_offsets before marker_offsets violates CostInput.INPUT_ORDER.
-    guess = SplinedKinematicsSolution(states_table=states_table, parameters=[
+    guess = Solution(states_tables=states_tables, parameters=[
         FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)),
         MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)),
     ])
     with pytest.raises(ValueError, match='ordered by CostInput.INPUT_ORDER'):
+        solver._validate_guess(guess)
+
+
+def test_validate_guess_rejects_mismatched_trials(tmp_path):
+    solver, states_tables = _make_offset_solver_and_states_tables(tmp_path)
+    # A guess whose trial name matches no registered trial.
+    guess = Solution(
+        states_tables={'other': states_tables['offsets']},
+        parameters=[
+            MarkerOffset('/markerset/m_body', Bounds(-1.0, 1.0), np.zeros(3)),
+            FrameOffset('/bodyset/body/pof', Bounds(-1.0, 1.0), np.zeros(3)),
+        ])
+    with pytest.raises(ValueError, match='do not match the solver configuration'):
         solver._validate_guess(guess)
 
 
@@ -232,12 +244,12 @@ def test_pendulum_bilevel_recovers_marker_offset(tmp_path):
     model = create_double_pendulum(1.0, 1.0)
     add_b1_anchor_marker(model)
     model.initSystem()
-    marker_source = MarkerSource(trc_path, label_map=label_map)
+    marker_source = MarkerSource('markers', trc_path, label_map=label_map)
 
     solver = SplinedKinematicsSolver(
         model, convergence_tolerance=1e-5, knot_interval=0.05,
         position_weight=5.0)
-    solver.add_marker_reference_data(marker_source)
+    solver.add_trial(Trial('pendulum', [marker_source]))
     solver.add_cost(OffsetRegularizationCost(1e-4))
     solver.add_parameter(
         MarkerOffset('/markerset/m1', Bounds(-0.5, 0.5), np.zeros(3)))

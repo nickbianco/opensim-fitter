@@ -4,10 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import opensim as osim
 from scipy.interpolate import BSpline
-from osimfit.data_sources import MarkerSource
-from osimfit.solvers import (InverseKinematicsSolver,
-                             SplinedKinematicsSolver,
-                             SplinedKinematicsSolution)
+from osimfit.data_sources import MarkerSource, Trial
+from osimfit.solvers import InverseKinematicsSolver, SplinedKinematicsSolver
 
 # EXAMPLE SPRINT
 # --------------
@@ -21,8 +19,7 @@ from osimfit.solvers import (InverseKinematicsSolver,
 # ---------
 
 # Load the marker data and model.
-marker_fpath = 'sprint_markers.trc'
-marker_table = osim.TimeSeriesTableVec3(marker_fpath)
+marker_table = osim.TimeSeriesTableVec3('sprint_markers.trc')
 model = osim.Model('LaiUhlrich2022_scaled.osim')
 model.initSystem()
 
@@ -38,7 +35,7 @@ labels = [label for label in labels if label not in columns_to_remove]
 label_map = {label: f'/markerset/{label}' for label in labels}
 
 # Create a MarkerSource with the option to trim the data to a specific time range.
-marker_source = MarkerSource(marker_fpath,
+marker_source = MarkerSource('sprint_markers', 'sprint_markers.trc',
                              labels_to_remove=columns_to_remove,
                              label_map=label_map,
                              trim_to_range=(1.5, 2.4))
@@ -48,10 +45,10 @@ marker_source = MarkerSource(marker_fpath,
 solver = InverseKinematicsSolver(model,
                                  convergence_tolerance=1e-2,
                                  position_weight=1.0)
-solver.add_marker_reference_data(marker_source)
+solver.add_trial(Trial('sprint', [marker_source]))
 ik_solution = solver.solve()
 sto = osim.STOFileAdapter()
-sto.write(ik_solution.states_table, 'sprint_ik_solution.sto')
+sto.write(ik_solution.states_tables['sprint'], 'sprint_ik_solution.sto')
 
 # Spline-based inverse kinematics
 # -------------------------------
@@ -64,11 +61,10 @@ for knot_interval in knot_intervals:
                                      convergence_tolerance=1e-4,
                                      position_weight=1.0,
                                      knot_interval=knot_interval)
-    solver.add_marker_reference_data(marker_source)
-    spline_ik_solution = solver.solve(SplinedKinematicsSolution(
-        states_table=osim.TimeSeriesTable('sprint_ik_solution.sto')))
+    solver.add_trial(Trial('sprint', [marker_source]))
+    spline_ik_solution = solver.solve(ik_solution)
     sto = osim.STOFileAdapter()
-    sto.write(spline_ik_solution.states_table,
+    sto.write(spline_ik_solution.states_tables['sprint'],
               f'sprint_spline_based_ik_solution_knot{int(knot_interval*1000)}.sto')
 
 # Plot joint kinematics
@@ -117,11 +113,11 @@ time_range = [1.575, 2.075]
 tableProcessor = osim.TableProcessor('sprint_ik_solution.sto')
 tableProcessor.append(osim.TabOpLowPassFilter(10))
 tableProcessor.append(osim.TabOpAppendCoordinateValueDerivativesAsSpeeds())
-ik_solution = tableProcessor.process(model)
-ik_solution.addTableMetaDataString('inDegrees', 'no')
-ik_solution.trim(time_range[0], time_range[1])
+ik_states_table = tableProcessor.process(model)
+ik_states_table.addTableMetaDataString('inDegrees', 'no')
+ik_states_table.trim(time_range[0], time_range[1])
 ik_states = osim.StatesTrajectory.createFromStatesTable(
-    model, ik_solution, True, False, False)
+    model, ik_states_table, True, False, False)
 
 # Load the spline-based IK solution.
 spline_based_ik_solution = osim.TimeSeriesTable(
@@ -165,7 +161,7 @@ lit_vel_x, lit_vel_y = prepare_literature_curve(lit_velocities_raw)
 
 # Plot bflh lengths and lengthening speeds for the frame-by-frame and spline-based IK
 # solutions, along with the experimental data from Yu et al. 2008.
-ik_times = np.linspace(0, 100, len(ik_solution.getIndependentColumn()))
+ik_times = np.linspace(0, 100, len(ik_states_table.getIndependentColumn()))
 spline_ik_times = np.linspace(0, 100,
                               len(spline_based_ik_solution.getIndependentColumn()))
 fig, axes = plt.subplots(2, 1, figsize=(6, 7), sharex=True)

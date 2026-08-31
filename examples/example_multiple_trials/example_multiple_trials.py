@@ -1,11 +1,12 @@
 import os
 import time
 import numpy as np
-import matplotlib.pyplot as plt
 import opensim as osim
+import matplotlib.pyplot as plt
+
 from osimfit.data_sources import MarkerSource, Trial
 from osimfit.scaling import (Axis, PositionBasedScaler, MarkerMeasurement,
-                             AnthropometricMeasurement, AnthropometricScaler)
+                             AnthropometricMeasurement)
 from osimfit.solvers import (InverseKinematicsSolver, MarkerPlacer,
                              SplinedKinematicsSolver, Solution)
 from osimfit.model import BodyScale, MarkerOffset
@@ -15,36 +16,32 @@ from osimfit.bounds import Bounds
 from osimfit.utilities import (compute_marker_errors, plot_marker_errors,
                                plot_coordinates)
 
-# EXAMPLE RUN
-# -----------
-# This example demonstrates how to perform scaling and inverse kinematics for a running
-# motion using OpenSim Fitter.
+# EXAMPLE MULTIPLE TRIALS
+# -----------------------
+# This example demonstrates how to perform scaling and inverse kinematics across
+# multiple trials simultaneously using OpenSim Fitter. The example data comes from
+# subject #2 in the OpenCap validation dataset (https://simtk.org/projects/opencap).
+
+# Results directory.
+if not os.path.exists('results'):
+    os.mkdir('results')
 
 # Load data
 # ---------
 # Load the marker data and model.
-markers_fpath = 'run_5_5_1_1.trc'
-markers_table = osim.TimeSeriesTableVec3(markers_fpath)
+markers_table = osim.TimeSeriesTableVec3('walking1.trc')
 marker_labels = markers_table.getColumnLabels()
-modelProcessor = osim.ModelProcessor('FB_Model_WuTsai.osim')
-modelProcessor.append(osim.ModOpRemoveMuscles())
-model = modelProcessor.process()
+model = osim.Model('LaiArnoldModified2017_poly_withArms_weldHand_generic.osim')
 model.initSystem()
 
-# Widen the bounds on the pelvis rotational coordinates.
-coordset = model.updCoordinateSet()
-for coord_name in ['pelvis_rotation', 'pelvis_list', 'pelvis_tilt']:
-    coord = coordset.get(coord_name)
-    coord.setRangeMin(-2.5)
-    coord.setRangeMax(2.5)
-
 # Define the tracking markers.
-tracking_markers = ['RBACK', 'T10']
-for marker in ['UARM', 'FARM',
-               'THI1', 'THI2', 'THI3', 'THI4', 'THI5',
-               'SHA1', 'SHA2', 'SHA3', 'SHA4', 'SHA5']:
-    for side in ['L', 'R']:
+tracking_markers = []
+for marker in ['thigh1', 'thigh2', 'thigh3', 'thigh4', 'thigh5',
+               'shank_antsup', 'sh2', 'sh3', 'sh4']:
+    for side in ['L_', 'r_']:
         tracking_markers.append(f'{side}{marker}')
+tracking_markers.remove('L_thigh5')
+tracking_markers.remove('L_sh4')
 
 # Set markers as fixed or unfixed.
 markerset = model.updMarkerSet()
@@ -67,9 +64,7 @@ model.finalizeFromProperties()
 model.initSystem()
 
 # Save a clone of the unscaled model.
-model.setName('subject_example_run')
 unscaled_model = osim.Model(model)
-unscaled_model.printToXML('unscaled_generic.osim')
 
 # Define a mapping between marker names and marker paths.
 # (marker_name --> /marker/path)
@@ -81,56 +76,61 @@ marker_map = {label: f'/markerset/{label}' for label in marker_labels}
 # Each rule specifies a segment to scale, two markers whose inter-distance defines
 # the body scale, and the axis along which to apply it.
 scale_rules = [
-    ('torso', 'RPSIS', 'RSHO', Axis.YAxis),
-    ('torso', 'LPSIS', 'LSHO', Axis.YAxis),
-    ('torso', 'RSHO', 'LSHO', Axis.ZAxis),
-    ('pelvis', 'RASIS', 'LASIS', Axis.ZAxis),
-    ('pelvis', 'RPSIS', 'LPSIS', Axis.ZAxis),
-    ('pelvis', 'RPSIS', 'RASIS', Axis.XAxis),
-    ('pelvis', 'LPSIS', 'LASIS', Axis.XAxis),
-]
-for s in [('L', '_l'), ('R', '_r')]:
-    # upper body
-    scale_rules.append((f'humerus{s[1]}', f'{s[0]}SHO', f'{s[0]}LELB', Axis.YAxis))
-    scale_rules.append((f'humerus{s[1]}', f'{s[0]}LELB', f'{s[0]}MELB', Axis.XAxis))
-    scale_rules.append((f'humerus{s[1]}', f'{s[0]}LELB', f'{s[0]}MELB', Axis.ZAxis))
-    scale_rules.append((f'radius{s[1]}', f'{s[0]}LELB', f'{s[0]}LWRI', Axis.YAxis))
-    scale_rules.append((f'radius{s[1]}', f'{s[0]}LELB', f'{s[0]}MELB', Axis.XAxis))
-    scale_rules.append((f'radius{s[1]}', f'{s[0]}LELB', f'{s[0]}MELB', Axis.ZAxis))
-    scale_rules.append((f'ulna{s[1]}', f'{s[0]}LELB', f'{s[0]}LWRI', Axis.YAxis))
-    scale_rules.append((f'ulna{s[1]}', f'{s[0]}LELB', f'{s[0]}MELB', Axis.XAxis))
-    scale_rules.append((f'ulna{s[1]}', f'{s[0]}LELB', f'{s[0]}MELB', Axis.ZAxis))
-    scale_rules.append((f'hand{s[1]}', f'{s[0]}LELB', f'{s[0]}LWRI', Axis.YAxis))
-    scale_rules.append((f'hand{s[1]}', f'{s[0]}MWRI', f'{s[0]}LWRI', Axis.XAxis))
-    scale_rules.append((f'hand{s[1]}', f'{s[0]}MWRI', f'{s[0]}LWRI', Axis.ZAxis))
-    # lower body
-    scale_rules.append((f'femur{s[1]}', f'{s[0]}ASIS', f'{s[0]}LKNE', Axis.YAxis))
-    scale_rules.append((f'femur{s[1]}', f'{s[0]}LKNE', f'{s[0]}MKNE', Axis.XAxis))
-    scale_rules.append((f'femur{s[1]}', f'{s[0]}LKNE', f'{s[0]}MKNE', Axis.ZAxis))
-    scale_rules.append((f'tibia{s[1]}', f'{s[0]}LKNE', f'{s[0]}LANK', Axis.YAxis))
-    scale_rules.append((f'tibia{s[1]}', f'{s[0]}LANK', f'{s[0]}MANK', Axis.XAxis))
-    scale_rules.append((f'tibia{s[1]}', f'{s[0]}LANK', f'{s[0]}MANK', Axis.ZAxis))
-    scale_rules.append((f'calcn{s[1]}', f'{s[0]}HEEL', f'{s[0]}MT1', Axis.XAxis))
-    scale_rules.append((f'calcn{s[1]}', f'{s[0]}HEEL', f'{s[0]}MT5', Axis.XAxis))
-    scale_rules.append((f'calcn{s[1]}', f'{s[0]}MT1', f'{s[0]}MT5', Axis.ZAxis))
-    scale_rules.append((f'calcn{s[1]}', f'{s[0]}HEEL', f'{s[0]}LANK', Axis.YAxis))
-    scale_rules.append((f'toes{s[1]}', f'{s[0]}HEEL', f'{s[0]}MT1', Axis.XAxis))
-    scale_rules.append((f'toes{s[1]}', f'{s[0]}HEEL', f'{s[0]}MT5', Axis.XAxis))
-    scale_rules.append((f'toes{s[1]}', f'{s[0]}MT1', f'{s[0]}MT5', Axis.ZAxis))
-    scale_rules.append((f'toes{s[1]}', f'{s[0]}HEEL', f'{s[0]}LANK', Axis.YAxis))
-    scale_rules.append((f'talus{s[1]}', f'{s[0]}HEEL', f'{s[0]}MT1', Axis.XAxis))
-    scale_rules.append((f'talus{s[1]}', f'{s[0]}HEEL', f'{s[0]}MT5', Axis.XAxis))
-    scale_rules.append((f'talus{s[1]}', f'{s[0]}MT1', f'{s[0]}MT5', Axis.ZAxis))
-    scale_rules.append((f'talus{s[1]}', f'{s[0]}HEEL', f'{s[0]}LANK', Axis.YAxis))
+    ('torso', 'r.PSIS', 'R_Shoulder', Axis.YAxis),
+    ('torso', 'L.PSIS', 'L_Shoulder', Axis.YAxis),
+    ('torso', 'R_Shoulder', 'L_Shoulder', Axis.ZAxis),
 
+    ('pelvis', 'r.ASIS', 'L.ASIS', Axis.ZAxis),
+    ('pelvis', 'r.PSIS', 'L.PSIS', Axis.ZAxis),
+    ('pelvis', 'R_HJC', 'L_HJC', Axis.ZAxis),
+    ('pelvis', 'r.PSIS', 'r.ASIS', Axis.XAxis),
+    ('pelvis', 'L.PSIS', 'L.ASIS', Axis.XAxis),
+
+    ('humerus_r', 'R_Shoulder', 'R_elbow_lat', Axis.YAxis),
+    ('humerus_l', 'L_Shoulder', 'L_elbow_lat', Axis.YAxis),
+
+    ('radius_r', 'R_elbow_lat', 'R_wrist_radius', Axis.YAxis),
+    ('radius_l', 'L_elbow_lat', 'L_wrist_radius', Axis.YAxis),
+
+    ('ulna_r', 'R_elbow_med', 'R_wrist_ulna', Axis.YAxis),
+    ('ulna_l', 'L_elbow_med', 'L_wrist_ulna', Axis.YAxis),
+
+    ('hand_r', 'R_elbow_lat', 'R_wrist_radius', Axis.YAxis),
+    ('hand_l', 'L_elbow_lat', 'L_wrist_radius', Axis.YAxis),
+
+    ('femur_r', 'r.ASIS', 'r_knee', Axis.YAxis),
+    ('femur_l', 'L.ASIS', 'L_knee', Axis.YAxis),
+
+    ('patella_r', 'r.ASIS', 'r_knee', Axis.YAxis),
+    ('patella_l', 'L.ASIS', 'L_knee', Axis.YAxis),
+
+    ('tibia_r', 'r_knee', 'r_ankle', Axis.YAxis),
+    ('tibia_l', 'L_knee', 'L_ankle', Axis.YAxis),
+
+    ('calcn_r', 'r_calc', 'r_toe', Axis.XAxis),
+    ('calcn_r', 'r_calc', 'r_5meta', Axis.XAxis),
+    ('calcn_r', 'r_toe', 'r_5meta', Axis.ZAxis),
+    ('calcn_r', 'r_calc', 'r_ankle', Axis.YAxis),
+    ('toes_r', 'r_calc', 'r_toe', Axis.XAxis),
+    ('toes_r', 'r_calc', 'r_5meta', Axis.XAxis),
+    ('toes_r', 'r_toe', 'r_5meta', Axis.ZAxis),
+    ('toes_r', 'r_calc', 'r_ankle', Axis.YAxis),
+
+    ('calcn_l', 'L_calc', 'L_toe', Axis.XAxis),
+    ('calcn_l', 'L_calc', 'L_5meta', Axis.XAxis),
+    ('calcn_l', 'L_toe', 'L_5meta', Axis.ZAxis),
+    ('calcn_l', 'L_calc', 'L_ankle', Axis.YAxis),
+    ('toes_l', 'L_calc', 'L_toe', Axis.XAxis),
+    ('toes_l', 'L_calc', 'L_5meta', Axis.XAxis),
+    ('toes_l', 'L_toe', 'L_5meta', Axis.ZAxis),
+    ('toes_l', 'L_calc', 'L_ankle', Axis.YAxis),
+]
 
 # Create a MarkerSource and PositionBasedScaler.
-markers_to_remove = ['IMUBACK', 'IMULFOOT', 'IMULSHA', 'IMULTHI', 'IMUPELVIS',
-                     'IMURFOOT', 'IMURSHA', 'IMURTHI']
-time_range = (28.885, 30.1)
-marker_source = MarkerSource('run_markers', markers_fpath,
-                             labels_to_remove=markers_to_remove,
-                             trim_to_range=time_range)
+markers_to_remove = ['L_HJC_reg', 'L_forearm', 'L_humerus',
+                     'R_HJC_reg', 'R_forearm', 'R_humerus']
+marker_source = MarkerSource('walking1_markers', 'walking1.trc',
+                             labels_to_remove=markers_to_remove)
 position_scaler = PositionBasedScaler(model, marker_source)
 
 # Add scaling rules to the PositionBasedScaler.
@@ -146,14 +146,31 @@ position_scaler.add_symmetry_pair('radius_l', 'radius_r')
 position_scaler.add_symmetry_pair('ulna_l', 'ulna_r')
 position_scaler.add_symmetry_pair('hand_l', 'hand_r')
 position_scaler.add_symmetry_pair('femur_l', 'femur_r')
+position_scaler.add_symmetry_pair('patella_l', 'patella_r')
 position_scaler.add_symmetry_pair('tibia_l', 'tibia_r')
 position_scaler.add_symmetry_pair('calcn_l', 'calcn_r')
-position_scaler.add_symmetry_pair('talus_l', 'talus_r')
 position_scaler.add_symmetry_pair('toes_l', 'toes_r')
 
 # Scale the model.
 scaled_model = position_scaler.scale()
-scaled_model.printToXML('subject_marker_scaled_run.osim')
+scaled_model.printToXML(os.path.join('results', 'subject_marker_scaled.osim'))
+
+# Assemble trials.
+# ----------------
+trial_ranges = {
+    'walking1': (0, 1.570),
+    'squats1': (0, 1.6),
+    'DJ1': (1.25, 2.0),
+    'STS1': (0, 1.825)
+}
+
+trials = []
+for trial_name, trial_range in trial_ranges.items():
+    marker_source = MarkerSource(f'{trial_name}_markers', f'{trial_name}.trc',
+                                 label_map=marker_map,
+                                 labels_to_remove=markers_to_remove,
+                                 trim_to_range=trial_range)
+    trials.append(Trial(trial_name, [marker_source]))
 
 # Anthropometric measurements
 # ---------------------------
@@ -185,23 +202,13 @@ for name, (station1_path, station2_path, axis) in ansur_measurements_map.items()
     ansur_measurements.append(
         AnthropometricMeasurement(name, station1_path, station2_path, axis))
 
-# Construct the trial
-# -------------------
-# Create a new marker source with updated column labels representing the full path to
-# each marker.
-marker_source = MarkerSource('run_markers', markers_fpath, label_map=marker_map,
-                             labels_to_remove=markers_to_remove,
-                             trim_to_range=time_range)
-marker_source.write('run_markers.trc')
-
-# Bundle the marker data for this motion into a Trial which we we'll use in each
-# optimization step below.
-trial = Trial('run', [marker_source])
-
 # Place markers
 # -------------
+# Create a MarkerPlacer.
 placer = MarkerPlacer(scaled_model)
-placer.add_trial(trial)
+# Add the trials.
+for trial in trials:
+    placer.add_trial(trial)
 solution = placer.solve()
 # Update both 'scaled_model', which we'll use to generate a guess via inverse
 # kinematics, and 'unscaled_model' which we'll use in the final bilevel optimization.
@@ -214,20 +221,24 @@ unscaled_model = placer.update_model(unscaled_model, solution)
 solver = InverseKinematicsSolver(scaled_model,
                                  convergence_tolerance=1e-2,
                                  position_weight=1.0)
-solver.add_trial(trial)
+for trial in trials:
+    solver.add_trial(trial)
 ik_solution = solver.solve()
 sto = osim.STOFileAdapter()
-sto.write(ik_solution.states_tables['run'], 'run_ik_solution.sto')
+for trial in trials:
+    sto.write(ik_solution.states_tables[trial.name],
+              os.path.join('results', f'{trial.name}_ik_solution.sto'))
 
 # Spline-based inverse kinematics
 # -------------------------------
 # Construct a SplinedKinematicsSolver to solve for the model kinematics and body
 # lengths that best match the marker data.
 solver = SplinedKinematicsSolver(unscaled_model,
-                                 convergence_tolerance=1e-3,
+                                 convergence_tolerance=1e-2,
                                  knot_interval=0.05,
-                                 position_weight=1.0)
-solver.add_trial(trial)
+                                 position_weight=5.0)
+for trial in trials:
+    solver.add_trial(trial)
 
 # Add additional cost terms to the solver.
 #
@@ -245,7 +256,7 @@ solver.add_cost(OffsetRegularizationCost(weight=1e-3))
 
 # Add body scales for each body in the model. Apply the same scales to groups of bodies,
 # including those that should share left-right symmetry.
-bounds = Bounds(0.5, 1.5)
+bounds = Bounds(0.5, 2.0)
 solver.add_parameter(BodyScale('/bodyset/torso', bounds, np.ones(3)))
 solver.add_parameter(BodyScale('/bodyset/pelvis', bounds, np.ones(3)))
 solver.add_parameter(BodyScale(['/bodyset/humerus_r', '/bodyset/humerus_l'],
@@ -254,24 +265,21 @@ solver.add_parameter(BodyScale(['/bodyset/radius_r', '/bodyset/radius_l',
                                 '/bodyset/ulna_r', '/bodyset/ulna_l',
                                 '/bodyset/hand_r', '/bodyset/hand_l'],
                                bounds, np.ones(3)))
-solver.add_parameter(BodyScale(['/bodyset/femur_r', '/bodyset/femur_l'],
+solver.add_parameter(BodyScale(['/bodyset/femur_r', '/bodyset/femur_l',
+                                '/bodyset/patella_r', '/bodyset/patella_l'],
                                bounds, np.ones(3)))
 solver.add_parameter(BodyScale(['/bodyset/tibia_r', '/bodyset/tibia_l'],
                                bounds, np.ones(3)))
 solver.add_parameter(BodyScale(['/bodyset/calcn_r', '/bodyset/calcn_l',
-                                '/bodyset/toes_r', '/bodyset/toes_l',
-                                '/bodyset/talus_r', '/bodyset/talus_l'],
+                                '/bodyset/toes_r', '/bodyset/toes_l'],
                                bounds, np.ones(3)))
 # Add marker offset parameters for the tracking markers.
-tracking_bounds = Bounds(-0.25, 0.25)
-anatomical_bounds = Bounds(-0.02, 0.02)
+bounds = Bounds(-0.25, 0.25)
 for i in range(unscaled_model.getMarkerSet().getSize()):
     marker = unscaled_model.getMarkerSet().get(i)
-    path = marker.getAbsolutePathString()
     if not marker.get_fixed():
-        solver.add_parameter(MarkerOffset(path, tracking_bounds, np.zeros(3)))
-    elif not path.endswith('JC'):
-        solver.add_parameter(MarkerOffset(path, anatomical_bounds, np.zeros(3)))
+        path = marker.getAbsolutePathString()
+        solver.add_parameter(MarkerOffset(path, bounds, np.zeros(3)))
 
 # Gather the per-body XYZ body scales from the position-based scaling stage above,
 # averaging over the bodies in each parameter group.
@@ -283,29 +291,26 @@ for scale in parameters_guess:
                    for path in scale.paths]
         scale.value = np.mean(factors, axis=0)
 
-# Create an initial guess based on the the kinematics from the inverse kinematics
-# solution and the combined body scales set above.
+# Create an initial guess based on the kinematics from the inverse kinematics
+# solution and the position-based body scales set above.
 guess = Solution(states_tables=ik_solution.states_tables,
                  parameters=parameters_guess)
 bilevel_solution = solver.solve(guess)
-sto.write(bilevel_solution.states_tables['run'], 'run_bilevel_solution.sto')
+for trial in trials:
+    sto.write(bilevel_solution.states_tables[trial.name],
+              os.path.join('results', f'{trial.name}_bilevel_solution.sto'))
 bilevel_scaled_model = solver.update_model(unscaled_model, bilevel_solution)
-bilevel_scaled_model.printToXML('subject_bilevel_scaled_run.osim')
+bilevel_scaled_model.printToXML(os.path.join('results', 'subject_bilevel_scaled.osim'))
 
-# Convert the solution to a StatesTrajectory for computing marker errors.
-states_table = osim.TimeSeriesTable('run_bilevel_solution.sto')
-states_table.addTableMetaDataString('inDegrees', 'no')
-states_traj = osim.StatesTrajectory.createFromStatesTable(bilevel_scaled_model,
-                                                          states_table, True)
-
-# Plot the coordinates.
+# Plotting
+# --------
 coordinate_ranges = {
     'pelvis_tilt':      (-40, 40),
     'pelvis_list':      (-40, 40),
-    'pelvis_rotation':  (0, 200),
+    'pelvis_rotation':  (-40, 40),
     'pelvis_tx':        (-7.5, 2.5),
     'pelvis_ty':        (0, 2.5),
-    'pelvis_tz':        (-2.0, 1.0),
+    'pelvis_tz':        (-1.0, 1.0),
     'hip_rotation_r':   (-30, 30),
     'hip_rotation_l':   (-30, 30),
     'lumbar_extension': (-50, 50),
@@ -318,12 +323,28 @@ coordinate_ranges = {
     'arm_add_l':        (-100, 100),
     'arm_rot_l':        (-100, 100),
 }
-coordinates_pdf_fpath = 'run_bilevel_solution_coordinates.pdf'
-plot_coordinates(bilevel_scaled_model, states_traj,
-                 'run_bilevel_solution_coordinates.pdf',
-                 convert_radians_to_degrees=True,
-                 coordinate_ranges=coordinate_ranges)
 
-# Plot the marker errors.
-errors = compute_marker_errors(bilevel_scaled_model, states_traj, marker_source)
-plot_marker_errors(errors, 'run_bilevel_solution_marker_errors.pdf')
+bilevel_scaled_model = osim.Model(os.path.join('results',
+                                               'subject_bilevel_scaled.osim'))
+bilevel_scaled_model.initSystem();
+
+# Convert the solution to a StatesTrajectory for computing marker errors.
+for trial in trials:
+    states_table = osim.TimeSeriesTable(
+        os.path.join('results', f'{trial.name}_bilevel_solution.sto'))
+    states_table.addTableMetaDataString('inDegrees', 'no')
+    states_traj = osim.StatesTrajectory.createFromStatesTable(bilevel_scaled_model,
+                                                              states_table, True)
+
+    # Plot the coordinates.
+    plot_coordinates(bilevel_scaled_model, states_traj,
+                    os.path.join('results',
+                                 f'{trial.name}_bilevel_solution_coordinates.pdf'),
+                    convert_radians_to_degrees=True,
+                    coordinate_ranges=coordinate_ranges)
+
+    # Plot the marker errors.
+    errors = compute_marker_errors(bilevel_scaled_model, states_traj,
+                                   trial.get_data_source(f'{trial.name}_markers'))
+    plot_marker_errors(errors,
+        os.path.join('results', f'{trial.name}_bilevel_solution_marker_errors.pdf'))
