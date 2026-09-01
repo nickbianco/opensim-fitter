@@ -9,7 +9,7 @@ from .data_sources import MarkerSource
 
 def plot_coordinates(model: osim.Model, states: osim.StatesTrajectory,
                      pdf_fpath: str, convert_radians_to_degrees: bool=False,
-                     coordinate_ranges: dict = None):
+                     coordinate_ranges: dict = {}):
     """
     Plot coordinate trajectories across time.
 
