@@ -1,0 +1,6 @@
+[submodule "simbody"]
+	path = simbody
+	url = https://github.com/nickbianco/simbody.git
+[submodule "opensim-core"]
+	path = opensim-core
+	url = https://github.com/nickbianco/opensim-core.git
