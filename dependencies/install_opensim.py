@@ -10,6 +10,21 @@ with open('config.yaml') as f:
 
 python_root_dir = pathlib.Path(config['python_root_dir']).as_posix()
 cwd = os.path.dirname(os.path.abspath(__file__))
+repo_dir = os.path.dirname(cwd)
+
+source_dirs = {}
+for name in ('opensim-core', 'simbody'):
+    subprocess.run(['git', 'submodule', 'update', '--init', name],
+                   check=True, cwd=repo_dir)
+    source_dirs[name] = pathlib.Path(repo_dir, name).as_posix()
+    version = subprocess.run(['git', 'describe', '--tags', '--always'],
+                             check=True, cwd=source_dirs[name],
+                             capture_output=True, text=True).stdout.strip()
+    print(f'Building {name} at {version}')
+
+env = os.environ.copy()
+env['OPENSIM_CORE_SOURCE_DIR'] = source_dirs['opensim-core']
+env['SIMBODY_SOURCE_DIR'] = source_dirs['simbody']
 
 if sys.platform == 'win32':
     pwsh = shutil.which('pwsh') or shutil.which('powershell.exe') or 'pwsh'
@@ -18,7 +33,7 @@ if sys.platform == 'win32':
 else:
     cmd = ['bash', 'install_opensim.sh', python_root_dir]
 
-subprocess.run(cmd, check=True, cwd=cwd)
+subprocess.run(cmd, check=True, cwd=cwd, env=env)
 
 # Install the OpenSim Python package in the current environment.
 package = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'opensim',
