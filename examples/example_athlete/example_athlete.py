@@ -305,33 +305,33 @@ solver.add_cost(AnthropometricRegularizationCost(
 solver.add_cost(BodyScaleIsotropyCost(weight=1e-1))
 
 # Penalize marker and frame offsets that deviate far from their nominal values.
-solver.add_cost(OffsetRegularizationCost(weight=1e-3))
+solver.add_cost(OffsetRegularizationCost(weight=1e-2))
 
 # Penalize the mobilizer dimension factors away from 1.0. Without this the spine beam
 # lengths and scapulothoracic radii tend to absorb marker error and run to their
 # bounds, since a joint's internal geometry can partly mimic a change in pose.
 solver.add_cost(MobilizerDimensionRegularizationCost(weight=1e-3))
 
-# # Apply a pseudo-stiffness to the scapula and spine coordinates, which surface markers
-# # determine only weakly. Each is pulled toward its default value in the model, so the
-# # stiffness resists drift away from the neutral posture without narrowing the ranges.
-# coordinate_stiffnesses = {}
-# for coordinate, stiffness in [('cervical_bending', 1.0),
-#                               ('cervical_extension', 1.0),
-#                               ('cervical_rotation', 1.0),
-#                               ('lumbar_bending', 0.1),
-#                               ('lumbar_extension', 0.1),
-#                               ('lumbar_rotation', 0.1),
-#                               ('thorax_bending', 0.1),
-#                               ('thorax_extension', 0.1),
-#                               ('thorax_rotation', 0.1)]:
-#     joint = coordinate.split('_')[0]
-#     coordinate_stiffnesses[f'/jointset/{joint}/{coordinate}'] = stiffness
-# for side in ['r', 'l']:
-#     for motion in ['abduction', 'elevation', 'rotation']:
-#         coordinate_stiffnesses[
-#             f'/jointset/scapulothoracic_{side}/scapula_{motion}_{side}'] = 0.1
-# solver.add_cost(CoordinateStiffnessCost(coordinate_stiffnesses, weight=1e-3))
+# Apply a pseudo-stiffness to the scapula and spine coordinates, which surface markers
+# determine only weakly. Each is pulled toward its default value in the model, so the
+# stiffness resists drift away from the neutral posture without narrowing the ranges.
+coordinate_stiffnesses = {}
+for coordinate, stiffness in [('cervical_bending', 10.0),
+                              ('cervical_extension', 10.0),
+                              ('cervical_rotation', 10.0),
+                              ('lumbar_bending', 0.1),
+                              ('lumbar_extension', 0.1),
+                              ('lumbar_rotation', 0.1),
+                              ('thorax_bending', 0.1),
+                              ('thorax_extension', 0.1),
+                              ('thorax_rotation', 0.1)]:
+    joint = coordinate.split('_')[0]
+    coordinate_stiffnesses[f'/jointset/{joint}/{coordinate}'] = stiffness
+for side in ['r', 'l']:
+    for motion in ['abduction', 'elevation', 'rotation']:
+        coordinate_stiffnesses[
+            f'/jointset/scapulothoracic_{side}/scapula_{motion}_{side}'] = 1.0
+solver.add_cost(CoordinateStiffnessCost(coordinate_stiffnesses, weight=1e-2))
 
 # Add body scales for each body in the model. Apply the same scales to groups of bodies,
 # including those that should share left-right symmetry.

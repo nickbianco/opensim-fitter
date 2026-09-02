@@ -233,16 +233,20 @@ class Solver(ABC):
         Get a dictionary of common IPOPT options for use with CasADi's nlpsolver.
         """
         ipopt_options = {}
+        ipopt_options['print_level'] = print_level
+
         # We only support callback functions with first-order derivatives.
         ipopt_options['hessian_approximation'] = 'limited-memory'
-        # Based on Simbody's settings.
+        ipopt_options['limited_memory_max_history'] = 50
+        ipopt_options['mu_strategy'] = 'adaptive'
+
         ipopt_options['tol'] = self.convergence_tolerance
-        ipopt_options['dual_inf_tol'] = self.convergence_tolerance
-        ipopt_options['compl_inf_tol'] = self.convergence_tolerance
-        ipopt_options['acceptable_tol'] = self.convergence_tolerance
-        ipopt_options['acceptable_dual_inf_tol'] = self.convergence_tolerance
-        ipopt_options['acceptable_compl_inf_tol'] = self.convergence_tolerance
-        ipopt_options['print_level'] = print_level
+        # ipopt_options['dual_inf_tol'] = self.convergence_tolerance
+        # ipopt_options['compl_inf_tol'] = self.convergence_tolerance
+        # ipopt_options['acceptable_tol'] = self.convergence_tolerance
+        # ipopt_options['acceptable_dual_inf_tol'] = self.convergence_tolerance
+        # ipopt_options['acceptable_compl_inf_tol'] = self.convergence_tolerance
+
         # Avoids crashes in CasADi for larger problems.
         ipopt_options['mumps_pivot_order'] = 0
 

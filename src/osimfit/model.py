@@ -173,19 +173,41 @@ class ParameterGroups(ABC):
         Register a group descriptor, caching any model-derived data it needs.
         """
         self.groups.append(group)
+        self.mc.invalidate_applied_parameters(self.input_name)
 
     def replace(self, groups) -> None:
         """
         Replace every registered group, re-caching model-derived data.
         """
         self.groups = []
+        self.mc.invalidate_applied_parameters(self.input_name)
         for group in groups:
             self.add(group)
 
     def apply_to_state(self, state: osim.State, values: np.ndarray) -> None:
         """
-        Write `values` into `state`. Invalidates Stage::Instance and higher. The
-        default does nothing, for parameters that do not touch the State.
+        Write `values` into `state`, skipping the write when `values` are already the
+        ones last written to this same State.
+
+        A bilevel solve evaluates one cost callback per trial time sample, and every
+        one of them writes the same shared parameter values into the one State owned by
+        the `ModelCache`. Because each block's write is absolute rather than
+        compounding, the write only has to happen when the values change: the skip
+        turns O(num_time_samples) writes per objective evaluation into one, and leaves
+        Stage::Instance valid so the subsequent `realizePosition` need not recompute it.
+
+        Subclasses implement `_write_to_state`; this method is the memoized entry point
+        every caller should use.
+        """
+        if self.mc.is_applied_to_state(self.input_name, state, values):
+            return
+        self._write_to_state(state, values)
+        self.mc.mark_applied_to_state(self.input_name, state, values)
+
+    def _write_to_state(self, state: osim.State, values: np.ndarray) -> None:
+        """
+        Write `values` into `state` unconditionally. Invalidates Stage::Instance and
+        higher. The default does nothing, for parameters that do not touch the State.
         """
 
     def apply_to_tasks(self, tasks, values: np.ndarray) -> None:
@@ -212,7 +234,7 @@ class BodyScaleGroups(ParameterGroups):
     input_name = 'body_scales'
     group_type = BodyScaleGroup
 
-    def apply_to_state(self, state: osim.State, values: np.ndarray) -> None:
+    def _write_to_state(self, state: osim.State, values: np.ndarray) -> None:
         self.mc.set_scaled_mobilizer_frame_positions(state, values)
 
     def apply_to_tasks(self, tasks, values: np.ndarray) -> None:
@@ -347,7 +369,7 @@ class MobilizerParameterGroups(ParameterGroups):
         ``(3, num_variables_per_group)``.
         """
 
-    def apply_to_state(self, state: osim.State, values: np.ndarray) -> None:
+    def _write_to_state(self, state: osim.State, values: np.ndarray) -> None:
         for i, (joints, baselines) in enumerate(zip(self.joints, self.baselines)):
             factor = values[self.group_slice(i)]
             for joint, baseline in zip(joints, baselines):
@@ -490,6 +512,11 @@ class ModelCache:
         self.coordinate_map = self._get_coordinate_index_map(self.model,
                                                     skip_dependent_coordinates=True)
         self.coordinate_indexes = list(self.coordinate_map.values())
+        # The parameter blocks last written into a State via
+        # `ParameterGroups.apply_to_state`, keyed by `CostInput` field name, together
+        # with the State they were written to. See `is_applied_to_state`.
+        self._applied_state: osim.State = None
+        self._applied_parameters: dict[str, np.ndarray] = {}
         self.parameter_groups: dict[str, ParameterGroups] = {
             cls.input_name: cls(self) for cls in PARAMETER_GROUPS_TYPES}
         self.body_scale_group_inboard_joints: list[list[osim.Joint]] = []
@@ -534,6 +561,79 @@ class ModelCache:
             X_BM = joint.getOutboardFrame(self.state)
             self.baseline_p_BM[mbx] = X_BM.p().to_numpy()
             self.baseline_R_BM[mbx] = osim.Rotation(X_BM.R())
+
+    def is_applied_to_state(self, name: str, state: osim.State,
+                            values: np.ndarray) -> bool:
+        """
+        Whether the `name` parameter block already holds `values` in `state`, so that
+        writing them again would be a no-op.
+
+        Every parameter block writes absolutely rather than compounding, so a repeated
+        write of identical values changes nothing but does invalidate Stage::Instance.
+        The record is keyed on the State object so that a different State (e.g. a
+        second solve, or a caller's own copy) never reads another's record.
+
+        Parameters
+        ----------
+        name: str
+            The `CostInput` field name of the block.
+        state: osim.State
+            The State the values would be written to.
+        values: np.ndarray
+            The candidate block values.
+        """
+        if state is not self._applied_state:
+            return False
+        applied = self._applied_parameters.get(name)
+        return applied is not None and np.array_equal(applied, values)
+
+    def mark_applied_to_state(self, name: str, state: osim.State,
+                              values: np.ndarray) -> None:
+        """
+        Record that the `name` parameter block now holds `values` in `state`. Switching
+        to a different State drops every record, since none of them describe it.
+        """
+        if state is not self._applied_state:
+            self._applied_state = state
+            self._applied_parameters = {}
+        self._applied_parameters[name] = np.array(values, dtype=float, copy=True)
+
+    def invalidate_applied_parameters(self, name: str = None) -> None:
+        """
+        Drop the record of what a parameter block last wrote into a State, forcing the
+        next `ParameterGroups.apply_to_state` to write. Call this after writing the
+        underlying State variables by any other route (e.g.
+        `set_scaled_mobilizer_frame_positions` directly), or after the block's layout
+        changes.
+
+        Parameters
+        ----------
+        name: str, optional
+            The `CostInput` field name of the block to invalidate. Defaults to ``None``
+            (invalidate every block).
+        """
+        if name is None:
+            self._applied_parameters = {}
+        else:
+            self._applied_parameters.pop(name, None)
+
+    def apply_parameters_to_state(self, state: osim.State,
+                                  values_by_input: dict[str, np.ndarray]) -> None:
+        """
+        Write each parameter block in `values_by_input` into `state`, in
+        `CostInput.INPUT_ORDER`, skipping any block whose values are already there.
+
+        Parameters
+        ----------
+        state: osim.State
+            The State to update.
+        values_by_input: dict[str, np.ndarray]
+            The block values to write, keyed by `CostInput` field name. A field absent
+            from the mapping is left as it is in `state`.
+        """
+        for name, groups in self.parameter_groups.items():
+            if name in values_by_input:
+                groups.apply_to_state(state, values_by_input[name])
 
     def add_parameter_group(self, group) -> None:
         """
@@ -699,6 +799,11 @@ class ModelCache:
         body_scales: np.ndarray, shape (3 * len(body_scale_groups),)
             Flat XYZ body-scale variables, one Vec3 per BodyScaleGroup.
         """
+        # This writes the State variables that the 'body_scales' record describes, so
+        # drop that record: a direct caller bypasses the memo in
+        # `ParameterGroups.apply_to_state`, which re-records after calling through.
+        self.invalidate_applied_parameters('body_scales')
+
         num_groups = len(self.body_scale_groups)
         if (len(self.body_scale_group_outboard_joints) != num_groups
                 or len(self.body_scale_group_inboard_joints) != num_groups):

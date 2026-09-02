@@ -1378,6 +1378,10 @@ class BilevelCostRep(CallbackCostRep):
         self.marker_term = MarkerBilevelTerm(mc)
         self.frame_term = FrameBilevelTerm(mc)
         self.mc.cache_body_scale_group_joints()
+        # The parameter values last composed onto this rep's station tables, keyed by
+        # `CostInput` field name; ``None`` until the first composition. See
+        # `apply_state`.
+        self._composed_parameters: dict[str, np.ndarray] = None
 
     @property
     def terms(self) -> tuple[BilevelTerm, ...]:
@@ -1394,15 +1398,35 @@ class BilevelCostRep(CallbackCostRep):
         Blocks are composed in `CostInput.INPUT_ORDER`, which body-scale and offset
         composition relies on: a body scale sets each station absolutely from its
         base-frame location, and an offset then adds to that result.
+
+        Neither the State write nor the station composition depends on the
+        coordinates, and the parameter blocks are shared across every trial and time
+        sample, so both are skipped when this rep's inputs still carry the parameter
+        values already in place. That matters because a bilevel solve holds one rep per
+        trial time sample and evaluates all of them at the same parameter values, twice
+        per iteration (once for the objective and once for its gradient). The State
+        write is memoized on the `ModelCache`, since every rep shares one State; the
+        station composition is memoized here, since the station table is this rep's
+        own. Composition is all-or-nothing: an offset adds to whatever the body scales
+        left behind, so re-running one block alone would compound onto its own result.
         """
+        values = {}
         for i, name in enumerate(CostInput.INPUT_ORDER):
             if name == 'coordinates':
                 continue
-            groups = self.mc.parameter_groups[name]
-            values = np.atleast_1d(np.squeeze(arg[i].full())).astype(float)
-            groups.apply_to_state(self.state, values)
-            for term in self.terms:
-                groups.apply_to_tasks(term, values)
+            values[name] = np.atleast_1d(np.squeeze(arg[i].full())).astype(float)
+
+        self.mc.apply_parameters_to_state(self.state, values)
+
+        if self._composed_parameters is None or any(
+                not np.array_equal(self._composed_parameters[name], value)
+                for name, value in values.items()):
+            for name, value in values.items():
+                groups = self.mc.parameter_groups[name]
+                for term in self.terms:
+                    groups.apply_to_tasks(term, value)
+            self._composed_parameters = {
+                name: value.copy() for name, value in values.items()}
 
         q = np.zeros(self.state.getNQ())
         q[self.mc.coordinate_indexes] = np.squeeze(arg[0].full())
@@ -1565,7 +1589,10 @@ class AnthropometricRegularizationCostRep(CallbackCostRep):
         raise IndexError(f'Invalid input index {i} for {type(self).__name__}.')
 
     def _apply_body_scales(self, body_scales: np.ndarray) -> None:
-        self.mc.set_scaled_mobilizer_frame_positions(self.state, body_scales)
+        # Routed through the ModelCache so this rep shares the memoized State write
+        # with the tracking reps, which apply the same body scales to the same State.
+        self.mc.apply_parameters_to_state(
+            self.state, {'body_scales': body_scales})
         self.state.setQ(osim.Vector.createFromMat(self.default_q))
         self.mc.model.realizePosition(self.state)
 
