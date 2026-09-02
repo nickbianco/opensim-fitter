@@ -34,16 +34,30 @@ class CostInput:
         Flattened per-group XYZ marker offsets.
     frame_offsets: ca.MX, optional
         Flattened per-group XYZ frame offsets.
+    ellipsoid_radii: ca.MX, optional
+        Flattened per-group XYZ factors on EllipsoidJoint radii.
+    beam_lengths: ca.MX, optional
+        Per-group factors on CantileverFreeBeamJoint beam lengths, one per group.
+
+    Notes
+    -----
+    `INPUT_ORDER` is also the order in which a bilevel cost composes parameter blocks
+    onto a tracking term's stations, so body scales (which set a station absolutely)
+    must precede offsets (which add to it). See `ParameterGroups`.
     """
     INPUT_ORDER: ClassVar[tuple[str, ...]] = (
-        'coordinates', 'body_scales', 'marker_offsets', 'frame_offsets')
+        'coordinates', 'body_scales', 'marker_offsets', 'frame_offsets',
+        'ellipsoid_radii', 'beam_lengths')
     TRIPLET_INPUTS: ClassVar[tuple[str, ...]] = (
-        'body_scales', 'marker_offsets', 'frame_offsets')
+        'body_scales', 'marker_offsets', 'frame_offsets', 'ellipsoid_radii')
+    PARAMETER_INPUTS: ClassVar[tuple[str, ...]] = INPUT_ORDER[1:]
 
     coordinates: ca.MX = field(default_factory=lambda: ca.DM.zeros(0, 1))
     body_scales: ca.MX = field(default_factory=lambda: ca.DM.zeros(0, 1))
     marker_offsets: ca.MX = field(default_factory=lambda: ca.DM.zeros(0, 1))
     frame_offsets: ca.MX = field(default_factory=lambda: ca.DM.zeros(0, 1))
+    ellipsoid_radii: ca.MX = field(default_factory=lambda: ca.DM.zeros(0, 1))
+    beam_lengths: ca.MX = field(default_factory=lambda: ca.DM.zeros(0, 1))
 
     @classmethod
     def field_index(cls, name: str) -> int:
@@ -341,16 +355,22 @@ class CallbackCostRep(CostRep, Function):
         return 1
 
     def _get_input_size(self, i):
-        sizes = {
-            'coordinates': len(self.mc.coordinate_indexes),
-            'body_scales': 3 * len(self.mc.body_scale_groups),
-            'marker_offsets': 3 * len(self.mc.marker_offset_groups),
-            'frame_offsets': 3 * len(self.mc.frame_offset_groups),
-        }
         order = CostInput.INPUT_ORDER
         if not 0 <= i < len(order):
             raise IndexError(f'Invalid input index {i} for {type(self).__name__}.')
-        return sizes[order[i]]
+        name = order[i]
+        if name == 'coordinates':
+            return len(self.mc.coordinate_indexes)
+        return self.mc.parameter_groups[name].num_variables
+
+    def _empty_parameter_jacobians(self):
+        """
+        A zero Jacobian block for every parameter input, sized from the solver's
+        registered parameter groups. Used by reps whose cost does not depend on any
+        parameter.
+        """
+        return [np.zeros((1, self._get_input_size(i)))
+                for i in range(1, len(CostInput.INPUT_ORDER))]
 
     def _get_output_size(self, i):
         if i == 0:
@@ -444,6 +464,161 @@ class OffsetRegularizationCost(SymbolicCost):
         return self.weight * ca.sum(offsets**2)
 
 
+class MobilizerDimensionRegularizationCost(SymbolicCost):
+    """
+    A quadratic penalty on the mobilizer dimension factors -- ellipsoid radii and beam
+    lengths -- that encourages each toward `target`:
+
+        cost = weight * sum_i (f_i - target)^2
+
+    Both parameter types are dimensionless factors on the model's baseline geometry, so
+    a target of 1.0 keeps a joint's dimensions at their nominal values and the optimizer
+    only deviates when doing so substantially improves the primary tracking cost.
+    Without such a penalty these factors are prone to absorbing marker error and
+    running to their bounds, since a joint's internal geometry can often mimic the
+    effect of a pose change.
+
+    Parameters
+    ----------
+    weight: float
+        Non-negative scalar applied to the sum-of-squares.
+    target: float, optional
+        Per-factor target value. Default is 1.0.
+    """
+    required_inputs = frozenset({'ellipsoid_radii', 'beam_lengths'})
+
+    def __init__(self, weight: float, target: float = 1.0):
+        if weight < 0:
+            raise ValueError(
+                f'Expected weight to be non-negative, but got {weight}.')
+        self.weight = weight
+        self.target = target
+
+    def evaluate(self, input: CostInput) -> ca.MX:
+        dimensions = ca.vertcat(input.ellipsoid_radii, input.beam_lengths)
+        return self.weight * ca.sum((dimensions - self.target)**2)
+
+
+class CoordinateStiffnessCost(Cost):
+    """
+    A quadratic penalty that acts like a spring on selected coordinates, holding each
+    near a target value:
+
+        cost = weight * sum_i k_i * (q_i - target_i)^2
+
+    Reference data does not constrain every coordinate equally well. Scapula and spine
+    coordinates in particular are only weakly determined by surface markers, so they
+    are free to drift toward whatever value marginally improves the tracking error,
+    often into a non-physiological posture. A stiffness holds such a coordinate near a
+    neutral value unless the data gives a clear reason to move it, without constraining
+    it outright the way a narrowed range would.
+
+    The penalty is a function of the coordinates, so it is evaluated at every time
+    sample and time-averaged alongside the tracking error rather than once per solve.
+    Each stiffness therefore trades off directly against the time-averaged tracking
+    error.
+
+    Note that a coordinate's units set the scale of its stiffness: `k_i` multiplies
+    squared radians for a rotational coordinate and squared meters for a translational
+    one, so stiffnesses are not comparable across the two.
+
+    Parameters
+    ----------
+    stiffnesses: dict[str, float]
+        Mapping from absolute coordinate path to that coordinate's non-negative
+        stiffness. Only the coordinates named here are penalized.
+    targets: dict[str, float], optional
+        Mapping from absolute coordinate path to the value that coordinate is pulled
+        toward. Any coordinate absent from this mapping is pulled toward its default
+        value in the model, which is the neutral posture the solvers also seed from.
+        Defaults to ``None`` (every target taken from the model).
+    weight: float, optional
+        Non-negative scalar applied to the whole sum. Default is 1.0.
+
+    Raises
+    ------
+    ValueError
+        If `weight` or any stiffness is negative, or `stiffnesses` is empty.
+        `CoordinateStiffnessCostRep` additionally validates the coordinate paths
+        against the model.
+    """
+    required_inputs = frozenset({'coordinates'})
+
+    def __init__(self, stiffnesses: dict[str, float],
+                 targets: dict[str, float] = None, weight: float = 1.0):
+        if weight < 0:
+            raise ValueError(
+                f'Expected weight to be non-negative, but got {weight}.')
+        if not stiffnesses:
+            raise ValueError(
+                'CoordinateStiffnessCost requires at least one coordinate stiffness.')
+        for path, stiffness in stiffnesses.items():
+            if stiffness < 0:
+                raise ValueError(
+                    f'Expected the stiffness for {path} to be non-negative, but got '
+                    f'{stiffness}.')
+        self.weight = weight
+        self.stiffnesses = dict(stiffnesses)
+        self.targets = dict(targets) if targets else {}
+
+    def create_rep(self, mc: ModelCache) -> 'CoordinateStiffnessCostRep':
+        return CoordinateStiffnessCostRep(self, mc)
+
+
+class CoordinateStiffnessCostRep(CostRep):
+    """
+    The rep of a `CoordinateStiffnessCost`. It resolves each coordinate path to its
+    position in the `CostInput.coordinates` vector and fills in any target left
+    unspecified from the model, then evaluates a plain CasADi expression, so the cost is
+    differentiated symbolically with no callback overhead.
+
+    Parameters
+    ----------
+    cost: CoordinateStiffnessCost
+        The cost this rep represents.
+    mc: ModelCache
+        The solver's `ModelCache`, supplying the coordinate ordering and the default
+        coordinate values.
+
+    Raises
+    ------
+    ValueError
+        If a coordinate path is not an independent coordinate of the model. Dependent
+        (e.g. constrained) coordinates are absent from `ModelCache.coordinate_map` and
+        so cannot be penalized directly.
+    """
+
+    def __init__(self, cost: CoordinateStiffnessCost, mc: ModelCache):
+        self.cost = cost
+        # Element j of the coordinates vector is the j-th entry of coordinate_map, so a
+        # coordinate's position in that ordering is its index into the input.
+        order = list(mc.coordinate_map)
+        self.indexes: list[int] = []
+        self.stiffnesses: list[float] = []
+        self.targets: list[float] = []
+        for path, stiffness in cost.stiffnesses.items():
+            if path not in mc.coordinate_map:
+                known = 'is a dependent coordinate' if mc.model.hasComponent(path) \
+                    else 'is not a coordinate in the model'
+                raise ValueError(
+                    f'Cannot apply a coordinate stiffness to {path}: it {known}. '
+                    f'Expected one of the model\'s independent coordinates.')
+            self.indexes.append(order.index(path))
+            self.stiffnesses.append(float(stiffness))
+            if path in cost.targets:
+                self.targets.append(float(cost.targets[path]))
+            else:
+                coordinate = osim.Coordinate.safeDownCast(mc.model.getComponent(path))
+                self.targets.append(float(coordinate.getDefaultValue()))
+
+    def __call__(self, input: CostInput) -> ca.MX:
+        penalty = 0
+        for index, stiffness, target in zip(
+                self.indexes, self.stiffnesses, self.targets):
+            penalty += stiffness * (input.coordinates[index] - target)**2
+        return self.cost.weight * penalty
+
+
 ###########
 # HELPERS #
 ###########
@@ -452,6 +627,38 @@ def _calc_quaternion(state, frame):
     rotation = frame.getRotationInGround(state)
     quaternion = rotation.convertRotationToQuaternion()
     return np.array([quaternion.get(i) for i in range(4)])
+
+def _project_to_coordinates(mc: ModelCache, state: osim.State,
+                            f_u: osim.Vector) -> np.ndarray:
+    """
+    Convert a mobility-space gradient into a row of the error Jacobian with respect to
+    the independent generalized coordinates.
+
+    Simbody's station and frame Jacobian-transpose operators return a generalized force
+    in u-space, of length ``state.getNU()``, while `ModelCache.coordinate_map` indexes
+    q. The two spaces coincide only where qdot == u; in general, since qdot = N u, a
+    coordinate increment maps to a mobility increment through NInv, so the q-space
+    gradient is ``~NInv * f_u``.
+
+    Parameters
+    ----------
+    mc: ModelCache
+        The cache supplying the model and the independent coordinate q-indexes.
+    state: osim.State
+        A State realized through Position.
+    f_u: osim.Vector
+        The mobility-space gradient, length ``state.getNU()``.
+
+    Returns
+    -------
+    np.ndarray
+        The gradient with respect to the independent coordinates, shape
+        ``(1, len(mc.coordinate_indexes))``.
+    """
+    f_q = osim.Vector(state.getNQ(), 0.0)
+    mc.model.multiplyByNInv(state, True, f_u, f_q)
+    return np.expand_dims(f_q.to_numpy()[mc.coordinate_indexes], axis=0)
+
 
 def _calc_quaternion_jacobian(eps):
     # Simbody -> /SimTKcommon/Mechanics/include/SimTKcommon/internal/Rotation.h#L712
@@ -463,6 +670,49 @@ def _calc_quaternion_jacobian(eps):
         [ e[2], -e[1],  e[0]],
     ])
 
+##################
+# ERROR GRADIENT #
+##################
+
+@dataclass
+class ErrorGradient:
+    """
+    The intermediate gradient quantities a bilevel tracking term computes once per
+    evaluation, from which every registered parameter block assembles its own Jacobian.
+
+    This is the interface between costs and parameters: a term knows how its error
+    depends on body positions and station placements, a `ParameterGroups` knows how its
+    variables move those, and neither needs to know about the other. See
+    `ParameterGroups.calc_jacobian_block`.
+
+    Attributes
+    ----------
+    state: osim.State
+        The term's working State, realized to Position with this evaluation's parameter
+        values already applied.
+    Jq: np.ndarray
+        The error Jacobian with respect to the independent generalized coordinates,
+        shape ``(1, len(ModelCache.coordinate_indexes))``.
+    dp_GB: osim.VectorVec3
+        The error gradient with respect to each mobilized body's origin position in
+        Ground, length `ModelCache.num_mobod`. Parameters that shift a body rigidly
+        (body scales, mobilizer parameters) differentiate through this.
+    doffset: np.ndarray
+        The error gradient with respect to a shift of each task's station within its
+        base frame, shape ``(num_tasks, 3)``. Parameters that move a station within its
+        base frame (offsets, and the station-location part of a body scale)
+        differentiate through this.
+    tasks: Tasks
+        The term's task table, supplying `station_caches`, `base_stations`,
+        `offset_group_indexes`, `num_tasks`, and `offset_input`.
+    """
+    state: osim.State
+    Jq: np.ndarray
+    dp_GB: osim.VectorVec3
+    doffset: np.ndarray
+    tasks: 'Tasks'
+
+
 #########
 # TASKS #
 #########
@@ -470,7 +720,17 @@ def _calc_quaternion_jacobian(eps):
 class Tasks(ABC):
     """
     A base class for task-specific storage and registration.
+
+    Attributes
+    ----------
+    offset_input: str
+        The `CostInput` field whose offset groups apply to these tasks. An
+        `OffsetGroups` block contributes to a term only when this matches its
+        `input_name`, which is what keeps marker offsets out of the frame-offset block
+        and vice versa.
     """
+    offset_input: str = None
+
     @abstractmethod
     def initialize_tasks(self, state: osim.State, **kwargs) -> float:
         pass
@@ -480,6 +740,8 @@ class MarkerTasks(Tasks):
     """
     Marker-specific task storage and registration.
     """
+    offset_input = 'marker_offsets'
+
     def initialize_tasks(self):
         self.markers = []
         self.station_caches: list[StationCache] = []
@@ -533,6 +795,8 @@ class FrameTasks(Tasks):
     """
     Frame-specific task storage and registration.
     """
+    offset_input = 'frame_offsets'
+
     def initialize_tasks(self):
         self.frames = []
         self.station_caches: list[StationCache] = []
@@ -603,20 +867,19 @@ class FrameTasks(Tasks):
 class TrackingTerm(ABC):
     """
     A base class for tracking cost terms that compute a scalar error and its
-    Jacobian with respect to the model's generalized coordinates, body scales,
-    and other optimization variables. To implement a new tracking cost term, extend this
-    class and implement the abstract methods (calc_error, calc_jacobian) to compute the
-    error and its Jacobian.
+    derivatives with respect to a solver's optimization variables.
+
+    Every term implements `calc_error`. For derivatives, a term over the generalized
+    coordinates alone implements `calc_jacobian`, returning the coordinate Jacobian; a
+    term that also supports bilevel parameters implements `calc_error_gradient`
+    instead, returning the intermediate gradients each parameter block differentiates
+    through. See `BilevelTerm`.
     """
     def __init__(self):
         super().__init__()
 
     @abstractmethod
     def calc_error(self, state: osim.State, **kwargs) -> float:
-        pass
-
-    @abstractmethod
-    def calc_jacobian(self, state: osim.State, **kwargs) -> list[np.ndarray]:
         pass
 
 
@@ -680,12 +943,11 @@ class FrameTrackingTerm(FrameTasks, TrackingTerm):
             spatialError.set(i, osim.SpatialVec(w_error, p_error))
 
         # Calculate the frame (position and orientation) error Jacobian.
-        vec = osim.Vector(state.getNQ(), 0.0)
+        vec = osim.Vector(state.getNU(), 0.0)
         self.mc.model.multiplyByFrameJacobianTranspose(
             state, self.mobod_indexes, self.stations, spatialError, vec)
-        J = vec.to_numpy()
 
-        return [np.expand_dims(J[self.mc.coordinate_indexes], axis=0)]
+        return [_project_to_coordinates(self.mc, state, vec)]
 
 
 class MarkerTrackingTerm(MarkerTasks, TrackingTerm):
@@ -728,44 +990,77 @@ class MarkerTrackingTerm(MarkerTasks, TrackingTerm):
                 2.0 * weight * (p_model[2] - position[2])))
 
         # Calculate the position error Jacobian.
-        vec = osim.Vector(state.getNQ(), 0.0)
+        vec = osim.Vector(state.getNU(), 0.0)
         self.mc.model.multiplyByStationJacobianTranspose(
             state, self.mobod_indexes, self.stations, f_GP, vec)
 
-        return [np.expand_dims(vec.to_numpy()[self.mc.coordinate_indexes], axis=0)]
+        return [_project_to_coordinates(self.mc, state, vec)]
 
 
 class BilevelTerm(TrackingTerm):
     """
-    An intermediate base class that provides functionality common to bilevel cost terms.
+    An intermediate base class for tracking cost terms whose error depends on bilevel
+    parameters as well as on the generalized coordinates.
 
-    Applying body scales and placement offsets to the cached station locations is shared
-    across marker and frame terms; subclasses (via `MarkerTasks`/`FrameTasks`) supply the
-    per-task `station_caches`, `stations`, and `offset_group_indexes`.
+    Rather than assembling a Jacobian block per parameter type, a bilevel term computes
+    the two intermediate gradients that every parameter block differentiates through
+    and returns them in an `ErrorGradient`. Subclasses (via `MarkerTasks`/`FrameTasks`)
+    supply the per-task `station_caches`, `stations`, and `offset_group_indexes` that
+    the gradient carries.
     """
     def __init__(self):
         super().__init__()
 
-    def apply_scales(self, body_scales: np.ndarray) -> None:
-        for itask, cache in enumerate(self.station_caches):
-            s = cache.calc_scaled_base_station(body_scales)
-            self.stations.updElt(itask).set(0, float(s[0]))
-            self.stations.updElt(itask).set(1, float(s[1]))
-            self.stations.updElt(itask).set(2, float(s[2]))
+    def calc_zero_gradient(self, state: osim.State) -> 'ErrorGradient':
+        """
+        The `ErrorGradient` of a term with no registered tasks: every block is zero.
+        """
+        return ErrorGradient(
+            state=state,
+            Jq=np.zeros((1, len(self.mc.coordinate_indexes))),
+            dp_GB=osim.VectorVec3(self.mc.num_mobod, osim.Vec3(0)),
+            doffset=np.zeros((0, 3)),
+            tasks=self)
 
-    def apply_offsets(self, offsets: np.ndarray) -> None:
-        for i, g in enumerate(self.offset_group_indexes):
-            if g is None:
-                continue
-            o = np.asarray(offsets[3*g : 3*g+3], dtype=float)
-            s = self.stations.getElt(i).to_numpy() + o
-            self.stations.updElt(i).set(0, float(s[0]))
-            self.stations.updElt(i).set(1, float(s[1]))
-            self.stations.updElt(i).set(2, float(s[2]))
+    def calc_station_gradient(self, state: osim.State,
+                              dp_GS: osim.VectorVec3) -> np.ndarray:
+        """
+        Return the per-task sensitivity of the error to a shift of each task's station
+        within its base frame, shape ``(num_tasks, 3)``, given the per-task error
+        gradient in Ground.
+        """
+        doffset = np.zeros((self.num_tasks, 3))
+        for i, base_frame in enumerate(self.base_frames):
+            rotation = base_frame.getRotationInGround(state)
+            R_GB = np.array([[rotation.get(r, c) for c in range(3)] for r in range(3)])
+            doffset[i] = dp_GS.get(i).to_numpy() @ R_GB
+        return doffset
 
-    def apply_state(self, body_scales: np.ndarray, offsets: np.ndarray) -> None:
-        self.apply_scales(body_scales)
-        self.apply_offsets(offsets)
+    def scatter_to_bodies(self, dp_GS: osim.VectorVec3) -> osim.VectorVec3:
+        """
+        Scatter the per-task error gradient into a per-mobilized-body gradient with
+        respect to body origin positions in Ground.
+
+        Every parameter that shifts a body rigidly differentiates through this vector.
+        Because such a shift translates a station on that body identically and applies
+        no rotation, ``dp_GS_i / dp_GB[k_i] = I``, so the scatter is just
+
+            dp_GB[k] += dp_GS[i]   # for each task i on body k
+        """
+        dp_GB = osim.VectorVec3(self.mc.num_mobod, osim.Vec3(0))
+        for i in range(self.num_tasks):
+            k = int(self.mobod_indexes.getElt(i))
+            total = dp_GB.get(k).to_numpy() + dp_GS.get(i).to_numpy()
+            dp_GB.set(k, osim.Vec3(
+                float(total[0]), float(total[1]), float(total[2])))
+        return dp_GB
+
+    @abstractmethod
+    def calc_error_gradient(self, state: osim.State) -> 'ErrorGradient':
+        """
+        Return this term's `ErrorGradient` at `state`, which must already be realized
+        to Position with the current parameter values applied.
+        """
 
 
 class MarkerBilevelTerm(MarkerTasks, BilevelTerm):
@@ -794,65 +1089,32 @@ class MarkerBilevelTerm(MarkerTasks, BilevelTerm):
             error += weight * np.square(np.linalg.norm(p_model - position))
         return error
 
-    def calc_jacobian(self, state, **kwargs) -> list[np.ndarray]:
-        Jq = np.zeros((1, len(self.mc.coordinate_indexes)))
-        Js = np.zeros((1, 3 * len(self.mc.body_scale_groups)))
-        Jo = np.zeros((1, 3 * len(self.mc.marker_offset_groups)))
+    def calc_error_gradient(self, state) -> ErrorGradient:
         if self.num_tasks == 0:
-            return [Jq, Js, Jo]
+            return self.calc_zero_gradient(state)
 
         # Calculate the per-marker error gradient in Ground. This is a force-like term
-        # will be multiplied with (the transpose of) each position Jacobian below. Also,
-        # precompute the sensitivity of each marker's ground position to a shift from
-        # an offset variable.
+        # that will be multiplied with (the transpose of) each position Jacobian.
         dp_GS = osim.VectorVec3(self.num_tasks, osim.Vec3(0))
-        doffset = np.zeros((self.num_tasks, 3))
         for i, (frame, position, weight) in enumerate(
                 zip(self.base_frames, self.positions, self.weights)):
             p_GS = frame.findStationLocationInGround(state, self.stations.getElt(i))
             dp_GS.set(i, osim.Vec3(2.0 * weight * (p_GS[0] - position[0]),
                                    2.0 * weight * (p_GS[1] - position[1]),
                                    2.0 * weight * (p_GS[2] - position[2])))
-            rotation = frame.getRotationInGround(state)
-            R_GB = np.array([[rotation.get(r, c) for c in range(3)] for r in range(3)])
-            doffset[i] = dp_GS.get(i).to_numpy() @ R_GB
 
         # Calculate the Jacobian of the position error with respect to the coordinates.
-        vec = osim.Vector(state.getNQ(), 0.0)
+        vec = osim.Vector(state.getNU(), 0.0)
         self.mc.model.multiplyByStationJacobianTranspose(
             state, self.mobod_indexes, self.stations, dp_GS, vec)
-        Jq[0, :] = vec.to_numpy()[self.mc.coordinate_indexes]
+        Jq = _project_to_coordinates(self.mc, state, vec)
 
-        # Scatter per-station gradients for each task into a vector respresenting the
-        # error gradient with respect to body origins, which we need for the Jacobian
-        # operations below. Since the body scales only apply a translational shift and
-        # no rotation, `dp_GS_i / dp_GB[k_i] = I`, and we can compute the vector via:
-        #
-        #     dp_GB.get(k) += dp_GS.get(i)   # for each marker i on body k
-        #
-        dp_GB = osim.VectorVec3(self.mc.num_mobod, osim.Vec3(0))
-        for i in range(self.num_tasks):
-            k = int(self.mobod_indexes.getElt(i))
-            cur = dp_GB.get(k).to_numpy() + dp_GS.get(i).to_numpy()
-            dp_GB.set(k, osim.Vec3(float(cur[0]), float(cur[1]), float(cur[2])))
-
-        # Calculate the position-error Jacobian with respect to body scales.
-        Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB)
-
-        # Assemble the marker offset Jacobian based on the offset sensitivities. Also,
-        # include the contributions from the marker offsets to the Jacobian with respect
-        # to body scales.
-        for i in range(self.num_tasks):
-            g_off = self.offset_group_indexes[i]
-            g_scale = self.station_caches[i].body_scale_group_index
-            if g_off is None and g_scale is None:
-                continue
-            if g_off is not None:
-                Jo[0, 3*g_off:3*g_off+3] += doffset[i]
-            if g_scale is not None:
-                Js[0, 3*g_scale:3*g_scale+3] += self.base_stations[i] * doffset[i]
-
-        return [Jq, Js, Jo]
+        return ErrorGradient(
+            state=state,
+            Jq=Jq,
+            dp_GB=self.scatter_to_bodies(dp_GS),
+            doffset=self.calc_station_gradient(state, dp_GS),
+            tasks=self)
 
 
 class FrameBilevelTerm(FrameTasks, BilevelTerm):
@@ -887,21 +1149,15 @@ class FrameBilevelTerm(FrameTasks, BilevelTerm):
             error += position_error + orientation_error
         return error
 
-    def calc_jacobian(self, state, **kwargs) -> list[np.ndarray]:
-        Jq = np.zeros((1, len(self.mc.coordinate_indexes)))
-        Js = np.zeros((1, 3 * len(self.mc.body_scale_groups)))
-        Jo = np.zeros((1, 3 * len(self.mc.frame_offset_groups)))
+    def calc_error_gradient(self, state) -> ErrorGradient:
         if self.num_tasks == 0:
-            return [Jq, Js, Jo]
+            return self.calc_zero_gradient(state)
 
         # Loop over all frames and compute the "spatial error" (i.e., the combined
-        # position and orientation error) for each.
+        # position and orientation error) for each. Store the position-error gradient
+        # along the way, since the parameter blocks differentiate through it.
         spatialError = osim.VectorOfSpatialVec(self.num_tasks, osim.SpatialVec(0))
-        # Store the position-error gradient along the way. We need it for the body scale
-        # and offset Jacobian calculations. Also, precompute the sensitivity of each
-        # frame's ground position to a shift from an offset variable.
         dp_GF = osim.VectorVec3(self.num_tasks, osim.Vec3(0))
-        doffset = np.zeros((self.num_tasks, 3))
         for i, (frame, base_frame) in enumerate(zip(self.frames, self.base_frames)):
             wp = self.position_weights[i]
             wo = self.orientation_weights[i]
@@ -915,7 +1171,9 @@ class FrameBilevelTerm(FrameTasks, BilevelTerm):
                                    2.0 * wp * (p_GF[1] - position[1]),
                                    2.0 * wp * (p_GF[2] - position[2])))
 
-            # Calculate the per-frame orientation error in Ground.
+            # Calculate the per-frame orientation error in Ground. No bilevel parameter
+            # rotates a frame, so the orientation error enters the coordinate Jacobian
+            # only and is absent from the gradients the parameters consume.
             eps = _calc_quaternion(state, frame)
             jac_eps = _calc_quaternion_jacobian(eps)
             omega = jac_eps.T @ self.orientations[i]
@@ -926,48 +1184,18 @@ class FrameBilevelTerm(FrameTasks, BilevelTerm):
             # frame Jacobian operator below.
             spatialError.set(i, osim.SpatialVec(dw_GF, dp_GF.get(i)))
 
-            # Precompute the position sensitivity to a base-frame station shift.
-            rotation = base_frame.getRotationInGround(state)
-            R_GB = np.array([[rotation.get(r, c) for c in range(3)] for r in range(3)])
-            doffset[i] = dp_GF.get(i).to_numpy() @ R_GB
-
         # Calculate the frame (position and orientation) error Jacobian.
-        vec = osim.Vector(state.getNQ(), 0.0)
+        vec = osim.Vector(state.getNU(), 0.0)
         self.mc.model.multiplyByFrameJacobianTranspose(
             state, self.mobod_indexes, self.stations, spatialError, vec)
-        Jq[0, :] = vec.to_numpy()[self.mc.coordinate_indexes]
+        Jq = _project_to_coordinates(self.mc, state, vec)
 
-        # Scatter per-station gradients for each task into a vector respresenting the
-        # error gradient with respect to body origins, which we need for the Jacobian
-        # operations below. Since the body scales only apply a translational shift and
-        # no rotation, `dp_GF_i / dp_GB[k_i] = I`, and we can compute the vector via:
-        #
-        #     dp_GB.get(k) += dp_GF.get(i)   # for each frame i on body k
-        #
-        dp_GB = osim.VectorVec3(self.mc.num_mobod, osim.Vec3(0))
-        for i in range(self.num_tasks):
-            k = int(self.mobod_indexes.getElt(i))
-            cur = dp_GB.get(k).to_numpy() + dp_GF.get(i).to_numpy()
-            dp_GB.set(k, osim.Vec3(float(cur[0]), float(cur[1]), float(cur[2])))
-
-        # Calculate the position-error Jacobian with respect to body scales. This does
-        # not include the contributions from frame offsets, we will include that below.
-        Js = self.mc.calc_position_jacobian_wrt_body_scales(state, dp_GB)
-
-        # Assemble the frame offset Jacobian based on the offset sensitivities. Also,
-        # include the contributions from the frame offsets to the Jacobian with respect
-        # to body scales.
-        for i in range(self.num_tasks):
-            g_off = self.offset_group_indexes[i]
-            g_scale = self.station_caches[i].body_scale_group_index
-            if g_off is None and g_scale is None:
-                continue
-            if g_off is not None:
-                Jo[0, 3*g_off:3*g_off+3] += doffset[i]
-            if g_scale is not None:
-                Js[0, 3*g_scale:3*g_scale+3] += self.base_stations[i] * doffset[i]
-
-        return [Jq, Js, Jo]
+        return ErrorGradient(
+            state=state,
+            Jq=Jq,
+            dp_GB=self.scatter_to_bodies(dp_GF),
+            doffset=self.calc_station_gradient(state, dp_GF),
+            tasks=self)
 
 
 ##################
@@ -1071,8 +1299,7 @@ class TrackingCostRep(CallbackCostRep):
         self.apply_state(arg)
         J = (self.marker_term.calc_jacobian(self.state)[0] +
              self.frame_term.calc_jacobian(self.state)[0])
-        empty = np.zeros((1, 0))
-        return [J, empty, empty, empty]
+        return [J] + self._empty_parameter_jacobians()
 
 
 class BilevelCost(TrackingCostBase):
@@ -1152,20 +1379,30 @@ class BilevelCostRep(CallbackCostRep):
         self.frame_term = FrameBilevelTerm(mc)
         self.mc.cache_body_scale_group_joints()
 
+    @property
+    def terms(self) -> tuple[BilevelTerm, ...]:
+        """
+        This rep's tracking terms, whose errors and gradients sum to the rep's own.
+        """
+        return (self.marker_term, self.frame_term)
+
     def apply_state(self, arg):
         """
-        Apply input coordinates, body-scale variables, and offset variables to the
-        model State, then realize to Position.
+        Apply the input coordinates and every parameter block to the model State and to
+        each term's station table, then realize to Position.
+
+        Blocks are composed in `CostInput.INPUT_ORDER`, which body-scale and offset
+        composition relies on: a body scale sets each station absolutely from its
+        base-frame location, and an offset then adds to that result.
         """
-        body_scales = np.squeeze(arg[1].full())
-        body_scales = np.atleast_1d(body_scales).astype(float)
-        self.mc.set_scaled_mobilizer_frame_positions(self.state, body_scales)
-
-        marker_offsets = np.atleast_1d(np.squeeze(arg[2].full())).astype(float)
-        self.marker_term.apply_state(body_scales, marker_offsets)
-
-        frame_offsets = np.atleast_1d(np.squeeze(arg[3].full())).astype(float)
-        self.frame_term.apply_state(body_scales, frame_offsets)
+        for i, name in enumerate(CostInput.INPUT_ORDER):
+            if name == 'coordinates':
+                continue
+            groups = self.mc.parameter_groups[name]
+            values = np.atleast_1d(np.squeeze(arg[i].full())).astype(float)
+            groups.apply_to_state(self.state, values)
+            for term in self.terms:
+                groups.apply_to_tasks(term, values)
 
         q = np.zeros(self.state.getNQ())
         q[self.mc.coordinate_indexes] = np.squeeze(arg[0].full())
@@ -1196,9 +1433,21 @@ class BilevelCostRep(CallbackCostRep):
 
     def _jac_eval(self, arg):
         self.apply_state(arg)
-        Jq_m, Js_m, Jmo = self.marker_term.calc_jacobian(self.state)
-        Jq_f, Js_f, Jfo = self.frame_term.calc_jacobian(self.state)
-        return [Jq_m + Jq_f, Js_m + Js_f, Jmo, Jfo]
+
+        # Each term computes its intermediate gradients once; each parameter block then
+        # projects every term's gradient onto itself and the contributions are summed.
+        gradients = [term.calc_error_gradient(self.state) for term in self.terms]
+
+        Jq = sum(gradient.Jq for gradient in gradients)
+        blocks = []
+        for name in CostInput.PARAMETER_INPUTS:
+            groups = self.mc.parameter_groups[name]
+            block = np.zeros((1, groups.num_variables))
+            for gradient in gradients:
+                block += groups.calc_jacobian_block(gradient)
+            blocks.append(block)
+
+        return [Jq] + blocks
 
 
 class AnthropometricRegularizationCost(Cost):

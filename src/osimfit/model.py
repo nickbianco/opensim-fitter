@@ -63,6 +63,360 @@ class FrameOffsetGroup(OffsetGroup):
     """An `OffsetGroup` whose components are frames (offsets a frame's translation)."""
 
 
+@dataclass
+class MobilizerParameterGroup:
+    """
+    A group of joints sharing one factor on a mobilizer's own translation (as opposed
+    to the placement of its inboard or outboard frame, which is what a
+    `BodyScaleGroup` scales).
+
+    Attributes
+    ----------
+    joint_paths: list[str]
+        Absolute model paths to the joints in this group.
+    mobod_indexes: list[int]
+        `MobilizedBodyIndex` values of the joints' child bodies, paired with
+        joint_paths.
+    """
+    joint_paths: list[str]
+    mobod_indexes: list[int]
+
+
+@dataclass
+class EllipsoidRadiiGroup(MobilizerParameterGroup):
+    """A `MobilizerParameterGroup` whose joints are `osim.EllipsoidJoint`s."""
+
+
+@dataclass
+class BeamLengthGroup(MobilizerParameterGroup):
+    """A `MobilizerParameterGroup` whose joints are `osim.CantileverFreeBeamJoint`s."""
+
+
+###########
+# HELPERS #
+###########
+
+def _set_vec3(vec3: osim.Vec3, value: np.ndarray) -> None:
+    """
+    Overwrite an `osim.Vec3` in place from a length-3 array.
+    """
+    for i in range(3):
+        vec3.set(i, float(value[i]))
+
+
+def _to_numpy(mat: osim.Mat33) -> np.ndarray:
+    """
+    Convert an `osim.Mat33` to a (3, 3) array. `osim.Mat33` exposes no `to_numpy`.
+    """
+    return np.array([[mat.get(r, c) for c in range(3)] for r in range(3)])
+
+
+####################
+# PARAMETER GROUPS #
+####################
+
+class ParameterGroups(ABC):
+    """
+    The model-bound collection of every registered parameter group of one type, owning
+    one contiguous block of a bilevel problem's optimization variables.
+
+    A `ParameterGroups` is the single place that knows how one kind of parameter
+    couples to a cost: how many variables its block holds, how a value of that block is
+    written into the model (`apply_to_state`) or into a tracking term's station table
+    (`apply_to_tasks`), and how a term's `ErrorGradient` is projected onto that block
+    (`calc_jacobian_block`). Adding a new parameter type therefore means writing one
+    `ParameterGroups` subclass and registering it in `PARAMETER_GROUPS_TYPES`, rather
+    than editing every cost and solver that handles parameters.
+
+    Blocks are composed in `CostInput.INPUT_ORDER`. That order is significant for
+    `apply_to_tasks`: body scales set each station absolutely from its base-frame
+    location, and offsets then add to the result, so body scales must precede offsets.
+
+    Parameters
+    ----------
+    mc: ModelCache
+        The `ModelCache` these groups are registered on.
+
+    Attributes
+    ----------
+    input_name: str
+        The `CostInput` field this block feeds.
+    group_type: type
+        The group descriptor type (e.g., `BodyScaleGroup`) this collection holds.
+    num_variables_per_group: int
+        The number of optimization variables each registered group contributes.
+    """
+    input_name: str = None
+    group_type: type = None
+    num_variables_per_group: int = 3
+
+    def __init__(self, mc: 'ModelCache'):
+        self.mc = mc
+        self.groups: list = []
+
+    @property
+    def num_variables(self) -> int:
+        """
+        The total number of optimization variables in this block.
+        """
+        return self.num_variables_per_group * len(self.groups)
+
+    def group_slice(self, index: int) -> slice:
+        """
+        The slice of this block's variables belonging to group `index`.
+        """
+        n = self.num_variables_per_group
+        return slice(n * index, n * (index + 1))
+
+    def add(self, group) -> None:
+        """
+        Register a group descriptor, caching any model-derived data it needs.
+        """
+        self.groups.append(group)
+
+    def replace(self, groups) -> None:
+        """
+        Replace every registered group, re-caching model-derived data.
+        """
+        self.groups = []
+        for group in groups:
+            self.add(group)
+
+    def apply_to_state(self, state: osim.State, values: np.ndarray) -> None:
+        """
+        Write `values` into `state`. Invalidates Stage::Instance and higher. The
+        default does nothing, for parameters that do not touch the State.
+        """
+
+    def apply_to_tasks(self, tasks, values: np.ndarray) -> None:
+        """
+        Compose `values` into a tracking term's per-task station table. The default
+        does nothing, for parameters that do not move a station within its base frame.
+        """
+
+    @abstractmethod
+    def calc_jacobian_block(self, gradient) -> np.ndarray:
+        """
+        Return this block's row of the error Jacobian, shape ``(1, num_variables)``,
+        given one tracking term's `ErrorGradient`. A cost sums the blocks returned for
+        each of its terms.
+        """
+
+
+class BodyScaleGroups(ParameterGroups):
+    """
+    The registered `BodyScaleGroup`s. Body scales stretch each group body's inboard and
+    outboard mobilizer frame translations, and scale the base-frame location of any
+    station attached to a group body.
+    """
+    input_name = 'body_scales'
+    group_type = BodyScaleGroup
+
+    def apply_to_state(self, state: osim.State, values: np.ndarray) -> None:
+        self.mc.set_scaled_mobilizer_frame_positions(state, values)
+
+    def apply_to_tasks(self, tasks, values: np.ndarray) -> None:
+        # Set each station absolutely from its cached base-frame location, so repeated
+        # calls do not compound and so a station on an unscaled body is reset to base.
+        for itask, cache in enumerate(tasks.station_caches):
+            _set_vec3(tasks.stations.updElt(itask),
+                      cache.calc_scaled_base_station(values))
+
+    def calc_jacobian_block(self, gradient) -> np.ndarray:
+        Js = np.zeros((1, self.num_variables))
+        if gradient.tasks.num_tasks == 0:
+            return Js
+
+        # The contribution routed through each mobilizer frame translation.
+        Js = self.mc.calc_position_jacobian_wrt_body_scales(
+            gradient.state, gradient.dp_GB)
+
+        # Plus the contribution from scaling each station's base-frame location.
+        for i, cache in enumerate(gradient.tasks.station_caches):
+            g = cache.body_scale_group_index
+            if g is not None:
+                Js[0, self.group_slice(g)] += (
+                    gradient.tasks.base_stations[i] * gradient.doffset[i])
+
+        return Js
+
+
+class OffsetGroups(ParameterGroups):
+    """
+    The registered `OffsetGroup`s of one kind. An offset is an additive translation of a
+    component's placement, expressed in the component's base frame.
+
+    A term's tasks carry offsets for exactly one kind of component, declared by
+    `Tasks.offset_input`, so a term whose tasks are markers contributes nothing to the
+    frame-offset block and vice versa.
+    """
+    def apply_to_tasks(self, tasks, values: np.ndarray) -> None:
+        if tasks.offset_input != self.input_name:
+            return
+        for i, g in enumerate(tasks.offset_group_indexes):
+            if g is None:
+                continue
+            station = tasks.stations.getElt(i).to_numpy() + values[self.group_slice(g)]
+            _set_vec3(tasks.stations.updElt(i), station)
+
+    def calc_jacobian_block(self, gradient) -> np.ndarray:
+        Jo = np.zeros((1, self.num_variables))
+        if gradient.tasks.offset_input != self.input_name:
+            return Jo
+        for i, g in enumerate(gradient.tasks.offset_group_indexes):
+            if g is not None:
+                Jo[0, self.group_slice(g)] += gradient.doffset[i]
+        return Jo
+
+
+class MarkerOffsetGroups(OffsetGroups):
+    """The registered `MarkerOffsetGroup`s."""
+    input_name = 'marker_offsets'
+    group_type = MarkerOffsetGroup
+
+
+class FrameOffsetGroups(OffsetGroups):
+    """The registered `FrameOffsetGroup`s."""
+    input_name = 'frame_offsets'
+    group_type = FrameOffsetGroup
+
+
+class MobilizerParameterGroups(ParameterGroups):
+    """
+    The registered groups of one mobilizer parameter type (e.g., ellipsoid radii).
+
+    Each group's variables are dimensionless factors on the model's baseline value for
+    that parameter, cached per joint when the group is registered so that repeated
+    evaluation is absolute rather than compounding.
+
+    Because such a parameter shifts only the mobilizer's own translation, its Jacobian
+    is the joint's local Ground-frame column composed with the matter subsystem's
+    subtree-sum operator: ``dE/dfactor = baseline * (~J_local @ subtreeSum(dp_GB))``.
+    The parameter leaves the mobilizer's rotation untouched, so it does not enter a
+    frame orientation error.
+
+    Attributes
+    ----------
+    joint_type: type
+        The `osim.Joint` subclass the group's paths must resolve to.
+    """
+    joint_type: type = None
+
+    def __init__(self, mc: 'ModelCache'):
+        super().__init__(mc)
+        self.joints: list[list] = []
+        self.baselines: list[list[np.ndarray]] = []
+
+    def add(self, group) -> None:
+        super().add(group)
+        joints = []
+        baselines = []
+        for path in group.joint_paths:
+            joint = self.joint_type.safeDownCast(self.mc.model.getComponent(path))
+            if joint is None:
+                raise ValueError(
+                    f'Component at path {path} is not an {self.joint_type.__name__}.')
+            joints.append(joint)
+            baselines.append(self.read_baseline(joint))
+        self.joints.append(joints)
+        self.baselines.append(baselines)
+
+    def replace(self, groups) -> None:
+        self.joints = []
+        self.baselines = []
+        super().replace(groups)
+
+    @abstractmethod
+    def read_baseline(self, joint) -> np.ndarray:
+        """
+        Return the joint's baseline parameter value, shape
+        ``(num_variables_per_group,)``, read from its property.
+        """
+
+    @abstractmethod
+    def set_value(self, joint, state: osim.State, value: np.ndarray) -> None:
+        """
+        Write an absolute parameter `value` for `joint` into `state`.
+        """
+
+    @abstractmethod
+    def calc_local_jacobian(self, joint, state: osim.State) -> np.ndarray:
+        """
+        Return the joint's local Ground-frame position Jacobian of its child body
+        origin with respect to this parameter, shape
+        ``(3, num_variables_per_group)``.
+        """
+
+    def apply_to_state(self, state: osim.State, values: np.ndarray) -> None:
+        for i, (joints, baselines) in enumerate(zip(self.joints, self.baselines)):
+            factor = values[self.group_slice(i)]
+            for joint, baseline in zip(joints, baselines):
+                self.set_value(joint, state, baseline * factor)
+
+    def calc_jacobian_block(self, gradient) -> np.ndarray:
+        J = np.zeros((1, self.num_variables))
+        if gradient.tasks.num_tasks == 0:
+            return J
+
+        for i, (group, joints, baselines) in enumerate(
+                zip(self.groups, self.joints, self.baselines)):
+            for mobod_index, joint, baseline in zip(
+                    group.mobod_indexes, joints, baselines):
+                # Sum the per-body gradient over the mobilizer's outboard subtree,
+                # which the mobilizer translation shifts rigidly.
+                subtree_sum = (
+                    self.mc.model
+                    .multiplyByPositionJacobianWrtMobilizerTranslationTranspose(
+                        gradient.state, int(mobod_index),
+                        gradient.dp_GB).to_numpy())
+                local = self.calc_local_jacobian(joint, gradient.state)
+                J[0, self.group_slice(i)] += baseline * (local.T @ subtree_sum)
+
+        return J
+
+
+class EllipsoidRadiiGroups(MobilizerParameterGroups):
+    """The registered `EllipsoidRadiiGroup`s."""
+    input_name = 'ellipsoid_radii'
+    group_type = EllipsoidRadiiGroup
+    joint_type = osim.EllipsoidJoint
+    num_variables_per_group = 3
+
+    def read_baseline(self, joint) -> np.ndarray:
+        return joint.get_radii_x_y_z().to_numpy()
+
+    def set_value(self, joint, state: osim.State, value: np.ndarray) -> None:
+        joint.setRadii(state, osim.Vec3(
+            float(value[0]), float(value[1]), float(value[2])))
+
+    def calc_local_jacobian(self, joint, state: osim.State) -> np.ndarray:
+        return _to_numpy(joint.calcPositionJacobianWrtRadii(state))
+
+
+class BeamLengthGroups(MobilizerParameterGroups):
+    """The registered `BeamLengthGroup`s."""
+    input_name = 'beam_lengths'
+    group_type = BeamLengthGroup
+    joint_type = osim.CantileverFreeBeamJoint
+    num_variables_per_group = 1
+
+    def read_baseline(self, joint) -> np.ndarray:
+        return np.array([joint.get_beam_length()], dtype=float)
+
+    def set_value(self, joint, state: osim.State, value: np.ndarray) -> None:
+        joint.setLength(state, float(value[0]))
+
+    def calc_local_jacobian(self, joint, state: osim.State) -> np.ndarray:
+        return joint.calcPositionJacobianWrtLength(state).to_numpy().reshape(3, 1)
+
+
+# Every parameter type a bilevel problem supports, in `CostInput.INPUT_ORDER`. A
+# `ModelCache` instantiates one collection per entry.
+PARAMETER_GROUPS_TYPES: tuple[type, ...] = (
+    BodyScaleGroups, MarkerOffsetGroups, FrameOffsetGroups,
+    EllipsoidRadiiGroups, BeamLengthGroups)
+
+
 ###############
 # MODEL CACHE #
 ###############
@@ -93,12 +447,25 @@ class ModelCache:
         excluded).
     coordinate_indexes: list[int]
         The q-indexes of the independent coordinates, in registration order.
+    parameter_groups: dict[str, ParameterGroups]
+        The registered parameter groups, keyed by `CostInput` field name, one entry
+        per type in `PARAMETER_GROUPS_TYPES`. Each entry owns one contiguous block of
+        a bilevel problem's optimization variables; see `ParameterGroups`.
     body_scale_groups: list[BodyScaleGroup]
-        The list of BodyScaleGroups associated with this model.
+        The list of BodyScaleGroups associated with this model. A view of
+        ``parameter_groups['body_scales'].groups``.
     marker_offset_groups: list[MarkerOffsetGroup]
-        The list of MarkerOffsetGroups associated with this model.
+        The list of MarkerOffsetGroups associated with this model. A view of
+        ``parameter_groups['marker_offsets'].groups``.
     frame_offset_groups: list[FrameOffsetGroup]
-        The list of FrameOffsetGroups associated with this model.
+        The list of FrameOffsetGroups associated with this model. A view of
+        ``parameter_groups['frame_offsets'].groups``.
+    ellipsoid_radii_groups: list[EllipsoidRadiiGroup]
+        The list of EllipsoidRadiiGroups associated with this model. A view of
+        ``parameter_groups['ellipsoid_radii'].groups``.
+    beam_length_groups: list[BeamLengthGroup]
+        The list of BeamLengthGroups associated with this model. A view of
+        ``parameter_groups['beam_lengths'].groups``.
     parent_of: dict[int, int]
         Per-mobod parent in the multibody tree. ``parent_of[k]`` is the
         ``MobilizedBodyIndex`` of body ``k``'s parent (Ground has no entry).
@@ -123,14 +490,18 @@ class ModelCache:
         self.coordinate_map = self._get_coordinate_index_map(self.model,
                                                     skip_dependent_coordinates=True)
         self.coordinate_indexes = list(self.coordinate_map.values())
-        self.body_scale_groups: list[BodyScaleGroup] = []
-        self.marker_offset_groups: list[MarkerOffsetGroup] = []
-        self.frame_offset_groups: list[FrameOffsetGroup] = []
+        self.parameter_groups: dict[str, ParameterGroups] = {
+            cls.input_name: cls(self) for cls in PARAMETER_GROUPS_TYPES}
         self.body_scale_group_inboard_joints: list[list[osim.Joint]] = []
         self.body_scale_group_outboard_joints: list[list[osim.Joint]] = []
 
-        # For now, disallow models with joints where qdot != u.
-        assert(self.state.getNQ() == self.state.getNU())
+        # A quaternion-capable mobilizer (e.g. the MobilizedBody::Ellipsoid behind an
+        # EllipsoidJoint, or Free and Ball) always allocates `getMaxNQ()` slots in the
+        # State even when the Euler-angle modeling option is engaged and only
+        # `getNQInUse()` of them are meaningful. State::getNQ() therefore counts the
+        # unused slots, which is why it can exceed getNU(); `coordinate_map` is built
+        # from each Coordinate's true q index so those gaps are skipped rather than
+        # written through.
 
         # Mobilized body parents.
         self.parent_of: dict[int, int] = {}
@@ -172,7 +543,8 @@ class ModelCache:
 
         Parameters
         ----------
-        group: BodyScaleGroup, MarkerOffsetGroup, or FrameOffsetGroup
+        group: BodyScaleGroup, MarkerOffsetGroup, FrameOffsetGroup, \
+                EllipsoidRadiiGroup, or BeamLengthGroup
             The parameter group to register.
 
         Raises
@@ -180,21 +552,66 @@ class ModelCache:
         ValueError
             If `group` is not a recognized parameter group type.
         """
-        if isinstance(group, BodyScaleGroup):
-            self.body_scale_groups.append(group)
-        elif isinstance(group, MarkerOffsetGroup):
-            self.marker_offset_groups.append(group)
-        elif isinstance(group, FrameOffsetGroup):
-            self.frame_offset_groups.append(group)
-        else:
-            raise ValueError(
-                f'Unsupported parameter group type {type(group).__name__}.')
+        for groups in self.parameter_groups.values():
+            if isinstance(group, groups.group_type):
+                groups.add(group)
+                return
+
+        raise ValueError(
+            f'Unsupported parameter group type {type(group).__name__}.')
+
+    @property
+    def body_scale_groups(self) -> list[BodyScaleGroup]:
+        return self.parameter_groups['body_scales'].groups
+
+    @body_scale_groups.setter
+    def body_scale_groups(self, groups) -> None:
+        self.parameter_groups['body_scales'].replace(groups)
+
+    @property
+    def marker_offset_groups(self) -> list[MarkerOffsetGroup]:
+        return self.parameter_groups['marker_offsets'].groups
+
+    @marker_offset_groups.setter
+    def marker_offset_groups(self, groups) -> None:
+        self.parameter_groups['marker_offsets'].replace(groups)
+
+    @property
+    def frame_offset_groups(self) -> list[FrameOffsetGroup]:
+        return self.parameter_groups['frame_offsets'].groups
+
+    @frame_offset_groups.setter
+    def frame_offset_groups(self, groups) -> None:
+        self.parameter_groups['frame_offsets'].replace(groups)
+
+    @property
+    def ellipsoid_radii_groups(self) -> list[EllipsoidRadiiGroup]:
+        return self.parameter_groups['ellipsoid_radii'].groups
+
+    @ellipsoid_radii_groups.setter
+    def ellipsoid_radii_groups(self, groups) -> None:
+        self.parameter_groups['ellipsoid_radii'].replace(groups)
+
+    @property
+    def beam_length_groups(self) -> list[BeamLengthGroup]:
+        return self.parameter_groups['beam_lengths'].groups
+
+    @beam_length_groups.setter
+    def beam_length_groups(self, groups) -> None:
+        self.parameter_groups['beam_lengths'].replace(groups)
 
     @staticmethod
     def _get_coordinate_index_map(model: osim.Model,
                                   skip_dependent_coordinates: bool=True) -> dict:
         """
-        Get a mapping between coordinate paths and their indexes in the state vector.
+        Get a mapping between coordinate paths and their q-indexes in the state vector.
+
+        Each index comes from the Coordinate's own mobilizer, not from its position in
+        the state-variable ordering. The two differ whenever a mobilizer allocates more
+        q than it uses: a quaternion-capable mobilizer always reserves `getMaxNQ()`
+        slots, so a State can carry unused q slots that the state-variable ordering
+        does not enumerate. Using the enumeration position would shift every coordinate
+        after such a mobilizer into the wrong slot.
 
         Parameters
         ----------
@@ -206,15 +623,14 @@ class ModelCache:
         state = model.getWorkingState()
         state_paths = osim.createStateVariableNamesInSystemOrder(model)
         coordinate_map: dict[str, int] = {}
-        for i, state_path in enumerate(state_paths):
+        for state_path in state_paths:
             if 'value' in state_path:
                 coord_path = state_path.replace('/value', '')
                 coordinate = osim.Coordinate.safeDownCast(model.getComponent(coord_path))
-                if skip_dependent_coordinates:
-                    if not coordinate.isDependent(state):
-                        coordinate_map[coord_path] = i
-                else:
-                    coordinate_map[coord_path] = i
+                if skip_dependent_coordinates and coordinate.isDependent(state):
+                    continue
+                coordinate_map[coord_path] = model.getCoordinateQIndex(
+                    state, coordinate)
 
         return coordinate_map
 
@@ -381,6 +797,55 @@ class ModelCache:
             tscale_np = np.asarray(tscale, dtype=float)
             st.scale(osim.Vec3(float(tscale_np[0]), float(tscale_np[1]),
                                float(tscale_np[2])))
+
+    @staticmethod
+    def get_ellipsoid_joint_radii(model: osim.Model) -> dict[str, np.ndarray]:
+        """
+        Return a dictionary mapping `osim.EllipsoidJoint` paths to their current
+        'radii_x_y_z' property values.
+
+        Paired with `apply_ellipsoid_joint_radii` to hold ellipsoid radii fixed across
+        a `Model::scale()` call: `EllipsoidJoint::extendScale` multiplies the radii by
+        the parent frame's body scale factors, which this fitter treats as an
+        independent parameter rather than a consequence of body scaling.
+
+        Parameters
+        ----------
+        model: osim.Model
+            The model to read from.
+        """
+        radii: dict[str, np.ndarray] = {}
+        jointset = model.getJointSet()
+        for ijoint in range(jointset.getSize()):
+            joint = osim.EllipsoidJoint.safeDownCast(jointset.get(ijoint))
+            if joint is None:
+                continue
+            radii[joint.getAbsolutePathString()] = joint.get_radii_x_y_z().to_numpy()
+
+        return radii
+
+    @staticmethod
+    def apply_ellipsoid_joint_radii(model: osim.Model, radii: dict) -> None:
+        """
+        For each `(joint_path, Vec3)` entry in `radii`, overwrite that
+        `osim.EllipsoidJoint`'s 'radii_x_y_z' property.
+
+        Parameters
+        ----------
+        model: osim.Model
+            The model to mutate.
+        radii: dict[str, np.ndarray | osim.Vec3]
+            Mapping from EllipsoidJoint absolute path to a length-3 Vec3-like radii
+            value, as returned by `get_ellipsoid_joint_radii`.
+        """
+        for joint_path, value in radii.items():
+            joint = osim.EllipsoidJoint.safeDownCast(model.getComponent(joint_path))
+            if joint is None:
+                raise ValueError(
+                    f'Component at {joint_path} is not an EllipsoidJoint.')
+            value = np.asarray(value, dtype=float)
+            joint.set_radii_x_y_z(osim.Vec3(
+                float(value[0]), float(value[1]), float(value[2])))
 
     def calc_position_jacobian_wrt_body_scales(self, state: osim.State,
                                                dp_GB: osim.VectorVec3) -> np.ndarray:
@@ -667,18 +1132,20 @@ class Parameter(ABC):
         return new
 
 
-class Vec3Parameter(Parameter):
+class BlockParameter(Parameter):
     """
-    A parameter representing a Vec3 quantity in an OpenSim model.
+    A parameter whose optimization variables form one fixed-size block, shared across
+    one or more model components of the same type. Subclasses fix the block size by
+    implementing `num_variables`.
 
     Parameters
     ----------
     paths: str or list[str]
-        Absolute model path(s) to the component(s) sharing this parameter's Vec3 value.
+        Absolute model path(s) to the component(s) sharing this parameter's value.
     bounds: Bounds
-        Bounds applied to each element of the Vec3.
+        Bounds applied to each element of the block.
     value: np.ndarray
-        Initial value for the Vec3.
+        Initial value for the block.
     """
     def __init__(self, paths: str | list[str], bounds: Bounds, value: np.ndarray):
         if isinstance(paths, str):
@@ -695,14 +1162,28 @@ class Vec3Parameter(Parameter):
                 f'element(s), but got {value.size}.')
         self.value = value
 
+    def append_guess_and_bounds(self, x0: list, lbx: list, ubx: list) -> None:
+        x0 += self.value.tolist()
+        lbx += [self.bounds.lower_bound] * self.num_variables
+        ubx += [self.bounds.upper_bound] * self.num_variables
+
+
+class Vec3Parameter(BlockParameter):
+    """
+    A parameter representing a Vec3 quantity in an OpenSim model.
+    """
     @property
     def num_variables(self) -> int:
         return 3
 
-    def append_guess_and_bounds(self, x0: list, lbx: list, ubx: list) -> None:
-        x0 += self.value.tolist()
-        lbx += [self.bounds.lower_bound] * 3
-        ubx += [self.bounds.upper_bound] * 3
+
+class ScalarParameter(BlockParameter):
+    """
+    A parameter representing a scalar quantity in an OpenSim model.
+    """
+    @property
+    def num_variables(self) -> int:
+        return 1
 
 
 class BodyScale(Vec3Parameter):
@@ -846,3 +1327,108 @@ class FrameOffset(Vec3Parameter):
 
     def to_group(self) -> FrameOffsetGroup:
         return FrameOffsetGroup(list(self.paths), list(self.mobod_indexes))
+
+
+class MobilizerParameter(Parameter):
+    """
+    A parameter that scales a mobilizer's own translation, as a dimensionless factor on
+    the joint's baseline property value. Pass a single joint path to scale one joint, or
+    a list to share one factor across a group of joints (e.g., for left-right symmetry).
+
+    Unlike a `BodyScale`, which stretches the placement of a joint's inboard and
+    outboard frames, this scales the mobilizer's internal geometry, and so is
+    independent of any `BodyScale` registered on a neighboring body. `apply_to_model`
+    is multiplicative on the model's current property value, which lets a solver undo
+    the body scaling that `Model::scale()` may have applied to it; see
+    `ModelCache.get_ellipsoid_joint_radii`.
+
+    Attributes
+    ----------
+    joint_type: type
+        The `osim.Joint` subclass this parameter's paths must resolve to.
+    """
+    joint_type: type = None
+
+    def validate(self, mc: ModelCache) -> None:
+        if self.bounds.lower_bound <= 0.0:
+            raise ValueError(
+                f'{type(self).__name__} on {self.paths} requires a strictly positive '
+                f'lower bound, since the underlying mobilizer rejects a non-positive '
+                f'value, but got {self.bounds.lower_bound}.')
+        self.mobod_indexes = []
+        for path in self.paths:
+            joint = self.joint_type.safeDownCast(mc.model.getComponent(path))
+            if joint is None:
+                raise ValueError(
+                    f'Component at path {path} is not an '
+                    f'{self.joint_type.__name__}.')
+            self.mobod_indexes.append(
+                int(joint.getChildFrame().getMobilizedBodyIndex()))
+
+    def to_group(self):
+        return self.group_type(list(self.paths), list(self.mobod_indexes))
+
+
+class EllipsoidRadii(MobilizerParameter, Vec3Parameter):
+    """
+    An optimized Vec3 of factors on one or more `osim.EllipsoidJoint`s' radii. A factor
+    of 1.0 leaves a joint's 'radii_x_y_z' property unchanged.
+
+    Parameters
+    ----------
+    paths: str or list[str]
+        Absolute model path(s) to the EllipsoidJoint(s) whose radii are optimized.
+    bounds: Bounds
+        Bounds applied to each factor. The lower bound must be strictly positive.
+    value: np.ndarray, optional
+        Initial [fx, fy, fz] factors. Defaults to no scaling.
+    """
+    group_type = EllipsoidRadiiGroup
+    cost_input = 'ellipsoid_radii'
+    joint_type = osim.EllipsoidJoint
+
+    def __init__(self, paths: str | list[str], bounds: Bounds,
+                 value: np.ndarray = (1.0, 1.0, 1.0)):
+        super().__init__(paths, bounds, value)
+        self.mobod_indexes: list[int] = None
+
+    def apply_to_model(self, model: osim.Model) -> None:
+        for path in self.paths:
+            joint = osim.EllipsoidJoint.safeDownCast(model.getComponent(path))
+            radii = joint.get_radii_x_y_z()
+            joint.set_radii_x_y_z(osim.Vec3(
+                radii[0] * float(self.value[0]),
+                radii[1] * float(self.value[1]),
+                radii[2] * float(self.value[2])))
+
+
+class BeamLength(MobilizerParameter, ScalarParameter):
+    """
+    An optimized factor on one or more `osim.CantileverFreeBeamJoint`s' beam lengths. A
+    factor of 1.0 leaves a joint's 'beam_length' property unchanged.
+
+    Parameters
+    ----------
+    paths: str or list[str]
+        Absolute model path(s) to the CantileverFreeBeamJoint(s) whose beam length is
+        optimized.
+    bounds: Bounds
+        Bounds applied to the factor. The lower bound must be strictly positive.
+    value: np.ndarray, optional
+        Initial factor. Defaults to no scaling.
+    """
+    group_type = BeamLengthGroup
+    cost_input = 'beam_lengths'
+    joint_type = osim.CantileverFreeBeamJoint
+
+    def __init__(self, paths: str | list[str], bounds: Bounds,
+                 value: np.ndarray = (1.0,)):
+        super().__init__(paths, bounds, value)
+        self.mobod_indexes: list[int] = None
+
+    def apply_to_model(self, model: osim.Model) -> None:
+        for path in self.paths:
+            joint = osim.CantileverFreeBeamJoint.safeDownCast(
+                model.getComponent(path))
+            joint.set_beam_length(
+                joint.get_beam_length() * float(self.value[0]))

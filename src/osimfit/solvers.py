@@ -9,7 +9,8 @@ from .bounds import Bounds
 from .data_sources import Trial
 from .costs import (BilevelCost, BilevelCostRep, Cost, CostInput, CostRep,
                     TrackingCost)
-from .model import ModelCache, Parameter, BodyScale, MarkerOffset, FrameOffset
+from .model import (ModelCache, Parameter, BodyScale, MarkerOffset, FrameOffset,
+                    EllipsoidRadii, BeamLength)
 from .scaling import Axis, Scaler, ManualBodyScale
 
 
@@ -96,9 +97,17 @@ class Solution:
             q[coordinate_indexes] = q_opt[i, :]
             state.setQ(osim.Vector.createFromMat(q))
             if qdot_opt is not None:
+                # The spline differentiates the coordinates, giving qdot, while the
+                # State stores generalized speeds u. Since qdot = N(q) u, convert with
+                # NInv rather than assigning qdot directly; the two coincide only where
+                # qdot == u, which is not the case for e.g. an EllipsoidJoint.
                 qdot = np.zeros(state.getNQ())
                 qdot[coordinate_indexes] = qdot_opt[i, :]
-                state.setU(osim.Vector.createFromMat(qdot))
+                model.realizePosition(state)
+                u = osim.Vector(state.getNU(), 0.0)
+                model.multiplyByNInv(
+                    state, False, osim.Vector.createFromMat(qdot), u)
+                state.setU(u)
             statesTraj.append(state)
         return statesTraj.exportToTable(model)
 
@@ -513,8 +522,9 @@ class SplinedKinematicsSolver(TrackingSolver):
     contributes its own block of spline control points, with its own knot vector sized
     from its own duration, while the bilevel parameters are shared across every trial.
     The tracking objective uses the mean over trials of each trial's time-averaged
-    error. Registered `Cost` terms that depend only on the shared parameters are
-    evaluated once, not per trial.
+    error. A registered `Cost` that depends only on the shared parameters is evaluated
+    once, not per trial; one that reads the coordinates (e.g. `CoordinateStiffnessCost`)
+    is evaluated at every time sample and time-averaged along with the tracking error.
 
     Parameters
     ----------
@@ -532,7 +542,8 @@ class SplinedKinematicsSolver(TrackingSolver):
         The interval between knots in the B-spline basis. Default is 0.05 seconds. Every
         registered trial must span at least ``degree + 1`` knot intervals.
     """
-    SUPPORTED_INPUTS = frozenset({'body_scales', 'marker_offsets', 'frame_offsets'})
+    SUPPORTED_INPUTS = frozenset({'coordinates', 'body_scales', 'marker_offsets',
+                                 'frame_offsets', 'ellipsoid_radii', 'beam_lengths'})
 
     def __init__(self, model, convergence_tolerance=1e-4, position_weight=1.0,
                  orientation_weight=1.0, degree=3, knot_interval=0.05):
@@ -627,6 +638,20 @@ class SplinedKinematicsSolver(TrackingSolver):
         """
         return list(self._parameters_by_input.get(FrameOffset.cost_input, []))
 
+    @property
+    def ellipsoid_radii(self) -> list[EllipsoidRadii]:
+        """
+        The registered `EllipsoidRadii` parameters, in registration order.
+        """
+        return list(self._parameters_by_input.get(EllipsoidRadii.cost_input, []))
+
+    @property
+    def beam_lengths(self) -> list[BeamLength]:
+        """
+        The registered `BeamLength` parameters, in registration order.
+        """
+        return list(self._parameters_by_input.get(BeamLength.cost_input, []))
+
     def add_parameter(self, parameter: Parameter):
         """
         Register a `Parameter` to be optimized over in the bilevel optimization problem.
@@ -688,6 +713,7 @@ class SplinedKinematicsSolver(TrackingSolver):
 
         # Get pre-`Model::scale()` quanities.
         translation_scales = ModelCache.get_custom_joint_translation_scales(model)
+        ellipsoid_radii = ModelCache.get_ellipsoid_joint_radii(model)
 
         # Construct a scaler using the optimized body scales as manual scale factors.
         # This calls Model::scale() under the hood. Body scales are applied via the
@@ -706,8 +732,13 @@ class SplinedKinematicsSolver(TrackingSolver):
                         body_name, axis, float(parameter.value[ax_idx])))
         model = scaler.scale()
 
-        # Apply pre-`Model::scale()` quanities.
+        # Apply pre-`Model::scale()` quanities. Restoring the ellipsoid radii undoes
+        # `EllipsoidJoint::extendScale`, which multiplies them by the parent frame's
+        # body scale factors: this solver treats a joint's mobilizer geometry as
+        # independent of the body scales, so an `EllipsoidRadii` parameter is the only
+        # thing that may change it.
         ModelCache.apply_custom_joint_translation_scales(model, translation_scales)
+        ModelCache.apply_ellipsoid_joint_radii(model, ellipsoid_radii)
 
         # Apply the remaining optimized parameters (e.g., marker and frame offsets) to
         # the scaled model.
@@ -790,12 +821,6 @@ class SplinedKinematicsSolver(TrackingSolver):
 
         # Extract parameter dimensions.
         num_params = len(self.parameters)
-        num_scales = sum(p.num_variables for p in self.parameters
-                         if isinstance(p, BodyScale))
-        num_markers = sum(p.num_variables for p in self.parameters
-                          if isinstance(p, MarkerOffset))
-        num_frames = sum(p.num_variables for p in self.parameters
-                         if isinstance(p, FrameOffset))
 
         # Apply the parameters from the initial guess to the solver's list of registered
         # parameters.
@@ -805,11 +830,13 @@ class SplinedKinematicsSolver(TrackingSolver):
 
         # Define the optimization variables: one block of control points per trial,
         # followed by the parameter blocks shared across all trials.
+        # One symbolic block per parameter type, sized from the groups registered on
+        # the ModelCache and ordered by CostInput.INPUT_ORDER, matching the layout of
+        # the optimization vector assembled below.
         coeffs = [ca.MX.sym(f'coeffs_{itrial}', num_knots, num_coords)
                   for itrial, num_knots in enumerate(trial_num_knots)]
-        s = ca.MX.sym('body_scales', num_scales)
-        mo = ca.MX.sym('marker_offsets', num_markers)
-        fo = ca.MX.sym('frame_offsets', num_frames)
+        blocks = {name: ca.MX.sym(name, self.mc.parameter_groups[name].num_variables)
+                  for name in CostInput.PARAMETER_INPUTS}
         x0 = []
         lbx = []
         ubx = []
@@ -832,6 +859,18 @@ class SplinedKinematicsSolver(TrackingSolver):
 
         # Accumulate the tracking cost for each trial. Reps are held in a list for the
         # lifetime of the solve so CasADi's references to them stay valid.
+        #
+        # Registered costs are split by whether they read the coordinates. A
+        # coordinate-dependent cost has a different value at every time sample, so it
+        # is accumulated with the tracking error and receives the same time averaging;
+        # a cost over the shared parameters alone is evaluated once, after the loop.
+        coordinate_cost_reps = [
+            cost.create_rep(self.mc) for cost in self.costs
+            if 'coordinates' in cost.required_inputs]
+        parameter_cost_reps = [
+            cost.create_rep(self.mc) for cost in self.costs
+            if 'coordinates' not in cost.required_inputs]
+
         f = 0
         tracking_reps = []
         cost_type = BilevelCost if num_params > 0 else TrackingCost
@@ -851,9 +890,11 @@ class SplinedKinematicsSolver(TrackingSolver):
                     f'tracking_cost_trial_{itrial}_time_{itime}', self.mc, trial,
                     itime)
                 tracking_reps.append(tracking_rep)
-                cost_input = CostInput(coordinates=q[itime, :].T, body_scales=s,
-                                       marker_offsets=mo, frame_offsets=fo)
-                errors[itime] = tracking_rep(cost_input)
+                cost_input = CostInput(coordinates=q[itime, :].T, **blocks)
+                error = tracking_rep(cost_input)
+                for cost_rep in coordinate_cost_reps:
+                    error += cost_rep(cost_input)
+                errors[itime] = error
 
             f += self.compute_average_trapezoidal_error(errors, times)
 
@@ -865,13 +906,13 @@ class SplinedKinematicsSolver(TrackingSolver):
             self.assert_offset_groups_used(tracking_reps)
 
         # Add the cost terms on the parameters shared across all trials.
-        cost_reps = [cost.create_rep(self.mc) for cost in self.costs]
-        parameter_input = CostInput(body_scales=s, marker_offsets=mo, frame_offsets=fo)
-        for cost_rep in cost_reps:
+        parameter_input = CostInput(**blocks)
+        for cost_rep in parameter_cost_reps:
             f += cost_rep(parameter_input)
 
         # Solve.
-        x = ca.vertcat(*[ca.vec(c) for c in coeffs], s, mo, fo)
+        x = ca.vertcat(*[ca.vec(c) for c in coeffs],
+                       *[blocks[name] for name in CostInput.PARAMETER_INPUTS])
         nlp = {'x': x, 'f': f}
         opts = {}
         opts['ipopt'] = self.get_ipopt_options(print_level=5)
@@ -1017,12 +1058,10 @@ class MarkerPlacer(Solver):
 
         # Define the optimization variables: one pose per trial, followed by the shared
         # offsets.
-        num_markers = sum(mo.num_variables for mo in marker_offsets)
         poses = [ca.MX.sym(f'pose_{itrial}', num_coords)
                  for itrial in range(len(self.trials))]
-        s = ca.MX.sym('body_scales', 0)
-        mo = ca.MX.sym('marker_offsets', num_markers)
-        fo = ca.MX.sym('frame_offsets', 0)
+        blocks = {name: ca.MX.sym(name, self.mc.parameter_groups[name].num_variables)
+                  for name in CostInput.PARAMETER_INPUTS}
 
         # Define each pose's initial guess and bounds, seeding from the first row of
         # that trial's guess states table when one is supplied.
@@ -1054,15 +1093,15 @@ class MarkerPlacer(Solver):
                 f'marker_placer_cost_trial_{itrial}', self.mc, trial, 0)
             placement_reps.append(placement_rep)
             errors[itrial] = placement_rep(
-                CostInput(coordinates=poses[itrial], body_scales=s,
-                          marker_offsets=mo, frame_offsets=fo))
+                CostInput(coordinates=poses[itrial], **blocks))
 
         # Average over trials so the objective's magnitude is independent of the number
         # of trials.
         f = ca.sum1(errors) / len(self.trials)
 
         # Solve.
-        nlp = {'x': ca.vertcat(*poses, s, mo, fo), 'f': f}
+        nlp = {'x': ca.vertcat(
+            *poses, *[blocks[name] for name in CostInput.PARAMETER_INPUTS]), 'f': f}
         opts = {}
         opts['ipopt'] = self.get_ipopt_options(print_level=5)
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)

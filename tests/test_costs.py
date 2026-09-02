@@ -63,11 +63,15 @@ def test_splined_accepts_parameter_costs(double_pendulum_model):
     assert len(solver.costs) == 2
 
 
-def test_splined_rejects_coordinate_cost(double_pendulum_model):
+def test_splined_accepts_coordinate_cost(double_pendulum_model):
+    """
+    A coordinate-dependent cost is evaluated at every time sample of every trial, so
+    the splined solver supports it alongside its parameter costs.
+    """
     solver = SplinedKinematicsSolver(double_pendulum_model)
-    with pytest.raises(ValueError, match='coordinates'):
-        solver.add_cost(CoordinatePenalty())
-    assert solver.costs == []
+    solver.add_cost(CoordinatePenalty())
+    solver.add_cost(BodyScaleRegularizationCost(1.0))
+    assert len(solver.costs) == 2
 
 
 def test_registered_cost_reps_size_themselves_from_the_solvers_parameters():
@@ -265,7 +269,8 @@ def getP_BM(model: osim.Model, joint_index: int, state: osim.State):
 
 
 def build_bilevel_rep(name, mc, body_scale_groups=[], marker_offset_groups=[],
-                       frame_offset_groups=[], enable_fd=False):
+                       frame_offset_groups=[], ellipsoid_radii_groups=[],
+                       beam_length_groups=[], enable_fd=False):
     """
     Register the given parameter groups on `mc` and build a BilevelCostRep, which
     reads its groups from the ModelCache. Mirrors what BilevelCost.create_rep does,
@@ -274,6 +279,8 @@ def build_bilevel_rep(name, mc, body_scale_groups=[], marker_offset_groups=[],
     mc.body_scale_groups = list(body_scale_groups)
     mc.marker_offset_groups = list(marker_offset_groups)
     mc.frame_offset_groups = list(frame_offset_groups)
+    mc.ellipsoid_radii_groups = list(ellipsoid_radii_groups)
+    mc.beam_length_groups = list(beam_length_groups)
     return BilevelCostRep(name, mc, enable_fd=enable_fd)
 
 
@@ -616,9 +623,10 @@ def test_bilevel_cost_function_grouped_jacobian_sums_solo_and_matches_fd():
                                atol=1e-9)
 
 
-def test_bilevel_apply_state_shifts_station():
+def test_parameter_groups_shift_station():
     """
-    Use apply_state() to set each offset task's cached station to baseline + offset
+    Composing the body-scale and marker-offset blocks onto a term's stations, in
+    CostInput.INPUT_ORDER, sets each offset task's cached station to baseline + offset
     at identity body scale, leaving non-offset tasks untouched.
     """
     model = create_sliding_mass_model()
@@ -637,13 +645,19 @@ def test_bilevel_apply_state_shifts_station():
 
     body_scale = np.ones(3)
     offset = np.array([0.1, -0.2, 0.3])
-    term.apply_state(body_scale, offset)
+
+    def compose():
+        cost.mc.parameter_groups['body_scales'].apply_to_tasks(term, body_scale)
+        cost.mc.parameter_groups['marker_offsets'].apply_to_tasks(term, offset)
+
+    compose()
     np.testing.assert_allclose(term.stations.getElt(0).to_numpy(),
                                baseline_m1 + offset)
     np.testing.assert_allclose(term.stations.getElt(1).to_numpy(), baseline_m0)
 
-    # apply_state() is idempotent.
-    term.apply_state(body_scale, offset)
+    # Composition is idempotent: the body-scale block sets each station absolutely
+    # from its base-frame location before the offset block adds to it.
+    compose()
     np.testing.assert_allclose(term.stations.getElt(0).to_numpy(),
                                baseline_m1 + offset)
 
